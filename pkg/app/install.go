@@ -184,14 +184,14 @@ func writeClientConfig(path string, root map[string]any, original []byte) error 
 	}
 	out = append(out, '\n')
 	if original != nil {
-		if err := os.WriteFile(path+".bak", original, 0o644); err != nil {
+		if err := os.WriteFile(path+".bak", original, 0o600); err != nil {
 			return fmt.Errorf("writing backup: %w", err)
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, out, 0o644)
+	return os.WriteFile(path, out, 0o600)
 }
 
 // serverEntry is the client-config record: absolute binary path + profile ref.

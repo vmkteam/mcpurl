@@ -75,7 +75,7 @@ func (s *FileStore) Load(key string) (*Token, error) {
 }
 
 func (s *FileStore) Save(key string, t *Token) error {
-	data, err := json.Marshal(t)
+	data, err := json.Marshal(t) // #nosec G117 -- this IS the token store; 0600 file, explicit fallback backend
 	if err != nil {
 		return err
 	}

@@ -62,7 +62,7 @@ func (s KeychainStore) Save(key string, t *Token) error {
 	if err != nil {
 		return fmt.Errorf("keychain: %w", err)
 	}
-	plain, err := json.Marshal(t)
+	plain, err := json.Marshal(t) // #nosec G117 -- this IS the token store; encrypted below before touching disk
 	if err != nil {
 		return err
 	}

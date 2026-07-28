@@ -22,8 +22,10 @@ A local stdio bridge is the only path in, and the incumbent (`mcp-remote`)
 requires Node, stores tokens in plaintext and has a history of refresh-token
 races. mcpurl is a clean-room Go replacement:
 
-- **Single static binary** (darwin/linux/windows), MIT.
-- **Tokens live in the OS keychain** (file fallback), never in config files.
+- **Single static binary** (darwin/linux/windows), MIT; macOS builds are
+  signed and notarized.
+- **Tokens are encrypted at rest** (AES-256-GCM) with the key in the OS
+  keychain — never plaintext in config files.
 - **Refresh-rotation safe**: atomic writes + cross-process file lock; Keycloak
   "Revoke Refresh Token" mode is the design assumption, not an edge case.
   "Both tokens expired" ends in exactly one browser login — never a loop.
@@ -37,6 +39,8 @@ races. mcpurl is a clean-room Go replacement:
 ## Install
 
 ```bash
+brew install --cask vmkteam/tap/mcpurl
+# or:
 go install github.com/vmkteam/mcpurl/cmd/mcpurl@latest
 # or from a checkout:
 make install
@@ -126,8 +130,10 @@ On the first `401` mcpurl discovers the authorization server (RFC 9728
 `WWW-Authenticate`/well-known → RFC 8414 / OIDC metadata), validates the
 issuer and resource identifiers, refuses PKCE-less servers, and runs the
 Authorization Code + PKCE (S256) flow through your browser with the RFC 8707
-`resource` parameter. Tokens are stored in the macOS keychain / Secret
-Service (files with `0600` elsewhere), keyed by endpoint + client_id.
+`resource` parameter. Tokens are stored encrypted (AES-256-GCM) under
+`~/.config/mcpurl/tokens/`, keyed by endpoint + client_id, with the
+encryption key in the macOS keychain / Secret Service; `--no-keychain` (and
+Windows in v1) falls back to plain `0600` files.
 
 Refresh is proactive (60 s before expiry) and single-flight across
 processes: several bridge instances coordinate via a file lock, always

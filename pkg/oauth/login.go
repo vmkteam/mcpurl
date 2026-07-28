@@ -120,14 +120,16 @@ func (f *Flow) browserLogin(ctx context.Context, d *discovery, scopes []string) 
 	}, nil
 }
 
+// openBrowser launches the OS opener. The binaries are fixed and url is a
+// single argv argument (no shell) built from https-validated discovery data.
 func openBrowser(ctx context.Context, url string) error {
 	switch runtime.GOOS {
 	case "darwin":
-		return exec.CommandContext(ctx, "open", url).Start()
+		return exec.CommandContext(ctx, "open", url).Start() // #nosec G204 -- fixed binary, url as argv
 	case "linux":
-		return exec.CommandContext(ctx, "xdg-open", url).Start()
+		return exec.CommandContext(ctx, "xdg-open", url).Start() // #nosec G204 -- fixed binary, url as argv
 	case "windows":
-		return exec.CommandContext(ctx, "rundll32", "url.dll,FileProtocolHandler", url).Start()
+		return exec.CommandContext(ctx, "rundll32", "url.dll,FileProtocolHandler", url).Start() // #nosec G204 -- fixed binary, url as argv
 	}
 	return errors.New("unsupported platform")
 }
