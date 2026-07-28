@@ -270,7 +270,9 @@ func (b *Bridge) send(ctx context.Context, msg []byte) {
 		b.warnf("replay after re-init failed: %v", err)
 	}
 
-	b.logf("POST failed: %v", err)
+	// warn, not debug: the operator must learn about upstream failures
+	// (rate limits, 5xx) from the client's log even without -v.
+	b.warnf("POST failed: %v", err)
 	if errors.As(err, &he) && len(he.Body) > 0 {
 		b.logf("upstream body: %s", he.Body[:min(len(he.Body), 2048)])
 	}

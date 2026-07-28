@@ -153,6 +153,24 @@ func TestClearSessionResetsEventCursor(t *testing.T) {
 	assert.Empty(t, c.lastEventID)
 }
 
+// The bridge is transparent: rate limits are NOT retried — a 429 must reach
+// the caller as an error so the operator learns about it.
+func TestPost429Surfaces(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, nil)
+	err := c.Post(context.Background(), []byte(`{}`), nil)
+	var he *HTTPError
+	require.ErrorAs(t, err, &he)
+	assert.Equal(t, http.StatusTooManyRequests, he.Status)
+	assert.EqualValues(t, 1, calls.Load(), "no silent retries")
+}
+
 func TestPostHTTPError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)

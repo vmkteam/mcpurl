@@ -208,8 +208,10 @@ func (c *Client) doAuthed(ctx context.Context, build func(token string) (*http.R
 
 // Post sends one client→server JSON-RPC message. Every resulting
 // server→client message (single JSON body or each SSE event) is compacted
-// and passed to deliver. 401 is resolved via the TokenProvider; other
-// failures return *HTTPError or a transport error.
+// and passed to deliver. 401 is resolved via the TokenProvider; every other
+// failure (including 429 — the bridge is transparent, rate limits must stay
+// visible) returns *HTTPError or a transport error for the caller to
+// surface.
 func (c *Client) Post(ctx context.Context, payload []byte, deliver func([]byte)) error {
 	resp, err := c.doAuthed(ctx, func(token string) (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Endpoint, bytes.NewReader(payload))
