@@ -1,0 +1,6 @@
+/docs/
+/dist/
+/mcpurl
+*.mcpb
+.DS_Store
+.idea/

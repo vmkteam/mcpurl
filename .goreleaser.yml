@@ -1,0 +1,42 @@
+version: 2
+
+builds:
+  - main: ./cmd/mcpurl
+    binary: mcpurl
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    hooks:
+      post:
+        - cmd: >-
+            {{- if eq .Os "darwin" }}
+            quill sign-and-notarize "{{ .Path }}" --dry-run={{ .IsSnapshot }} --ad-hoc={{ .IsSnapshot }} -vv
+            {{- else }}
+            true
+            {{- end }}
+          env:
+            - QUILL_LOG_FILE=/tmp/quill-{{ .Target }}.log
+          output: true
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: 'checksums.txt'
+
+homebrew_casks:
+  - name: mcpurl
+    binaries:
+      - mcpurl
+    repository:
+      owner: vmkteam
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/vmkteam/mcpurl
+    description: "stdio to Streamable HTTP MCP bridge with local OAuth 2.1 PKCE"
