@@ -13,13 +13,17 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 )
 
 const (
-	methodS256    = "S256"     // the only PKCE method mcpurl speaks
-	scopeOpenID   = "openid"   // OIDC default scope
-	paramResource = "resource" // RFC 8707 resource indicator
+	methodS256    = "S256"           // the only PKCE method mcpurl speaks
+	scopeOpenID   = "openid"         // OIDC default scope
+	scopeProfile  = "profile"        // OIDC default scope
+	scopeOffline  = "offline_access" // OIDC Core §11: no refresh token without it
+	paramResource = "resource"       // RFC 8707 resource indicator
+	paramScope    = "scope"          // challenge parameter and token-response field
 
 	// Well-known document names (RFC 8414 / RFC 9728 / OIDC Discovery).
 	wkOAuthAS = "oauth-authorization-server"
@@ -101,7 +105,7 @@ func parseChallenge(h string) (resourceMetadata, scope string) {
 		switch m[1] {
 		case "resource_metadata":
 			resourceMetadata = m[2]
-		case "scope":
+		case paramScope:
 			scope = m[2]
 		}
 	}
@@ -229,7 +233,7 @@ func (f *Flow) discoverAS(ctx context.Context, issuer string) (*ASMetadata, erro
 		}
 		// PKCE guard: absent code_challenge_methods_supported means the AS
 		// does not support PKCE (RFC 8414) — refuse, no silent downgrade.
-		if !hasS256(md.CodeChallengeMethodsSupported) {
+		if !slices.Contains(md.CodeChallengeMethodsSupported, methodS256) {
 			return nil, fmt.Errorf("authorization server %s does not advertise PKCE S256 (code_challenge_methods_supported=%v) — refusing", issuer, md.CodeChallengeMethodsSupported)
 		}
 		md.FromOIDC = p.oidc
@@ -237,15 +241,6 @@ func (f *Flow) discoverAS(ctx context.Context, issuer string) (*ASMetadata, erro
 		return &md, nil
 	}
 	return nil, fmt.Errorf("authorization server metadata not found for %s: %w", issuer, lastErr)
-}
-
-func hasS256(methods []string) bool {
-	for _, m := range methods {
-		if m == methodS256 {
-			return true
-		}
-	}
-	return false
 }
 
 // discover runs the full chain (with caching) and resolves scopes.
@@ -278,26 +273,37 @@ func (f *Flow) discover(ctx context.Context, challenge string) (*discovery, erro
 }
 
 // resolveScopes: flag/profile > WWW-Authenticate scope (authoritative per
-// spec) > PRM scopes_supported > pragmatic OIDC default > none.
+// spec) > PRM scopes_supported > pragmatic OIDC default > none; every
+// discovery-driven answer then passes through withOffline.
 func (f *Flow) resolveScopes(d *discovery, challenge string) []string {
 	if len(f.Scopes) > 0 {
-		return f.Scopes
+		return f.Scopes // explicit override: verbatim, omissions included
 	}
+	supported := d.AS.ScopesSupported
 	if _, scope := parseChallenge(challenge); scope != "" {
-		return strings.Fields(scope)
+		return withOffline(supported, strings.Fields(scope))
 	}
 	if len(d.PRMScopes) > 0 {
-		return d.PRMScopes
+		return withOffline(supported, d.PRMScopes)
 	}
 	if d.AS.FromOIDC {
-		scopes := []string{scopeOpenID, "profile"}
-		for _, s := range d.AS.ScopesSupported {
-			if s == "offline_access" {
-				scopes = append(scopes, s)
-				break
-			}
-		}
-		return scopes
+		return withOffline(supported, []string{scopeOpenID, scopeProfile})
 	}
 	return nil
+}
+
+// withOffline returns scopes plus offline_access when the AS advertises it
+// (RFC 8414 scopes_supported) and scopes lack it — without it an OIDC AS
+// issues no refresh token, and neither a PRM document nor a 401 challenge is
+// obliged to ask for it. Scopes we were TOLD to request pass through
+// untouched; the one scope mcpurl adds on its own initiative is the one that
+// gets gated, so an AS that never mentions it cannot be handed an
+// invalid_scope. Always a fresh slice: the input may be cached discovery
+// state, while the result outlives it inside a stored Token.
+func withOffline(supported, scopes []string) []string {
+	out := slices.Clone(scopes)
+	if slices.Contains(scopes, scopeOffline) || !slices.Contains(supported, scopeOffline) {
+		return out
+	}
+	return append(out, scopeOffline)
 }

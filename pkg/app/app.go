@@ -189,6 +189,7 @@ func (a *App) flow() *oauth.Flow {
 		Store:        oauth.NewStore(a.opts.NoKeychain),
 		HTTP:         a.httpc,
 		Logf:         a.logf,
+		Warnf:        a.warnf,
 		Msg:          a.msg,
 	}
 }

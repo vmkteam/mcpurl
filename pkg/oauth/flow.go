@@ -29,7 +29,8 @@ type Flow struct {
 	LockDir      string       // default: LockDir()
 	HTTP         *http.Client // nil = http.DefaultClient
 	Logf         func(format string, args ...any)
-	Msg          io.Writer // user-facing output (browser hint); nil = stderr
+	Warnf        func(format string, args ...any) // operator-facing events; nil = Logf
+	Msg          io.Writer                        // user-facing output (browser hint); nil = stderr
 
 	discoMu sync.Mutex
 	disco   *discovery
@@ -86,6 +87,15 @@ func (f *Flow) debugf(format string, args ...any) {
 	if f.Logf != nil {
 		f.Logf(format, args...)
 	}
+}
+
+// warnf reports what an operator must learn without -v (mirrors Bridge.warnf).
+func (f *Flow) warnf(format string, args ...any) {
+	if f.Warnf != nil {
+		f.Warnf(format, args...)
+		return
+	}
+	f.debugf(format, args...)
 }
 
 func (f *Flow) printf(format string, args ...any) {
@@ -193,6 +203,13 @@ func (f *Flow) loginAndSave(ctx context.Context, key string, d *discovery, chall
 		return nil, err
 	}
 	t.Issuer, t.ClientID = d.AS.Issuer, f.ClientID
+	// No refresh token means this login repeats on every restart once the
+	// access token expires. Say so now: the alternative is the user meeting it
+	// as a browser popup days later, with nothing to point at.
+	if t.RefreshToken == "" {
+		f.warnf("%s issued no refresh_token (granted scope: %s) — a new browser login will be needed once this one expires; add %s to the profile scopes, and enable it for client %s",
+			d.AS.Issuer, strings.Join(t.Scopes, " "), scopeOffline, f.ClientID)
+	}
 	if err := f.Store.Save(key, t); err != nil {
 		return nil, fmt.Errorf("persisting token after login: %w", err)
 	}
@@ -259,7 +276,7 @@ func (f *Flow) refresh(ctx context.Context, d *discovery, canonical string, stor
 		RefreshToken: stored.RefreshToken, // keep unless rotated
 		Issuer:       d.AS.Issuer,
 		ClientID:     f.ClientID,
-		Scopes:       stored.Scopes,
+		Scopes:       grantedScopes(tr.Scope, stored.Scopes),
 	}
 	if tr.RefreshToken != "" {
 		t.RefreshToken = tr.RefreshToken // ALWAYS take the rotated one
@@ -267,10 +284,20 @@ func (f *Flow) refresh(ctx context.Context, d *discovery, canonical string, stor
 	if tr.ExpiresIn > 0 {
 		t.Expiry = time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second)
 	}
-	if tr.Scope != "" {
-		t.Scopes = strings.Fields(tr.Scope)
-	}
 	return t, nil
+}
+
+// grantedScopes prefers the AS's `scope` response over what was requested —
+// they differ whenever the AS silently drops scopes the client is not
+// configured for (authentik intersects the request with the provider's scope
+// mappings, so a requested offline_access can vanish). Storing the request
+// would make the token claim capabilities it does not have. RFC 6749 §5.1
+// permits omitting the field when it matches the request, hence the fallback.
+func grantedScopes(respScope string, requested []string) []string {
+	if respScope == "" {
+		return requested
+	}
+	return strings.Fields(respScope)
 }
 
 // Login runs the interactive browser flow unconditionally (CLI `mcpurl

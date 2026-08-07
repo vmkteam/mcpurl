@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -28,6 +29,7 @@ type fakeAS struct {
 	refreshCalls   atomic.Int32
 	alwaysInvalid  bool
 	expiresIn      int64
+	grantedScope   string // echoed as the response `scope` when set
 }
 
 func newFakeAS(t *testing.T) *fakeAS {
@@ -59,11 +61,15 @@ func newFakeAS(t *testing.T) *fakeAS {
 		}
 		f.seq++
 		f.currentRefresh = fmt.Sprintf("refresh-%d", f.seq)
-		json.NewEncoder(w).Encode(map[string]any{
+		resp := map[string]any{
 			"access_token":  fmt.Sprintf("access-%d", f.seq),
 			"refresh_token": f.currentRefresh,
 			"expires_in":    f.expiresIn,
-		})
+		}
+		if f.grantedScope != "" {
+			resp["scope"] = f.grantedScope
+		}
+		json.NewEncoder(w).Encode(resp)
 	})
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
@@ -166,6 +172,78 @@ func TestBothExpiredSingleLogin(t *testing.T) {
 	_, err = f.Token(context.Background(), "login-access", "")
 	require.Error(t, err, "want give-up error when a freshly logged-in token is rejected")
 	assert.EqualValues(t, 1, logins.Load(), "login loop")
+}
+
+// An AS that issues no refresh token condemns the user to a browser login per
+// restart. That must be said out loud at login, not discovered days later.
+func TestLoginWarnsWhenNoRefreshToken(t *testing.T) {
+	as := newFakeAS(t)
+	// Each login needs its own token dir: a shared one would let the second
+	// flow load the first's token and skip login entirely.
+	login := func(t *testing.T, issued *Token) string {
+		var warnings strings.Builder
+		f := newTestFlow(t, as, t.TempDir())
+		f.Warnf = func(format string, args ...any) { fmt.Fprintf(&warnings, format, args...) }
+		f.loginFn = func(context.Context, *discovery, []string) (*Token, error) { return issued, nil }
+		_, err := f.Token(context.Background(), "", "")
+		require.NoError(t, err)
+		return warnings.String()
+	}
+
+	out := login(t, &Token{AccessToken: "login-access", Expiry: time.Now().Add(time.Hour),
+		Scopes: []string{"openid", "profile"}})
+	assert.Contains(t, out, "no refresh_token")
+	assert.Contains(t, out, "offline_access", "the warning must name the fix")
+	assert.Contains(t, out, "openid profile", "and the scope actually granted")
+
+	// The happy path stays quiet.
+	assert.Empty(t, login(t, &Token{AccessToken: "login-access", RefreshToken: "login-refresh",
+		Expiry: time.Now().Add(time.Hour)}))
+
+	// With no Warnf wired the message must fall back to the debug log rather
+	// than vanish — the CLI is the only thing that sets Warnf.
+	var logged strings.Builder
+	f := newTestFlow(t, newFakeAS(t), t.TempDir())
+	f.Logf = func(format string, args ...any) { fmt.Fprintf(&logged, format, args...) }
+	f.loginFn = func(context.Context, *discovery, []string) (*Token, error) {
+		return &Token{AccessToken: "login-access", Expiry: time.Now().Add(time.Hour)}, nil
+	}
+	_, err := f.Token(context.Background(), "", "")
+	require.NoError(t, err)
+	assert.Contains(t, logged.String(), "no refresh_token")
+}
+
+// A refresh may come back with fewer scopes than the stored token carried —
+// the AS is entitled to narrow them. The stored token must follow the AS,
+// not the memory of what was once requested.
+func TestRefreshAdoptsGrantedScopes(t *testing.T) {
+	as := newFakeAS(t)
+	as.grantedScope = "openid profile"
+	f := newTestFlow(t, as, t.TempDir())
+
+	canonical, _ := Canonicalize(f.Endpoint)
+	key := Key(canonical, f.ClientID)
+	require.NoError(t, f.Store.Save(key, &Token{
+		AccessToken: "access-0", RefreshToken: "refresh-0",
+		Expiry: time.Now().Add(-time.Minute),
+		Scopes: []string{"openid", "profile", "offline_access"},
+	}))
+
+	_, err := f.Token(context.Background(), "", "")
+	require.NoError(t, err)
+	stored, err := f.Store.Load(key)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"openid", "profile"}, stored.Scopes)
+
+	// Silence means "unchanged" (RFC 6749 §5.1), not "none". Needs its own AS:
+	// the one above already rotated past refresh-0, and seedToken plants it.
+	f2 := newTestFlow(t, newFakeAS(t), t.TempDir())
+	key2 := seedToken(t, f2)
+	_, err = f2.Token(context.Background(), "", "")
+	require.NoError(t, err)
+	stored2, err := f2.Store.Load(key2)
+	require.NoError(t, err)
+	assert.Empty(t, stored2.Scopes, "seeded token carried none; the AS said nothing")
 }
 
 func TestNoClientID(t *testing.T) {
