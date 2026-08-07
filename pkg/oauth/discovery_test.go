@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -80,6 +81,53 @@ func TestDiscoveryChain(t *testing.T) {
 		"PRM scopes must win absent a challenge")
 	assert.Equal(t, []string{"mcp:tools"}, f.resolveScopes(d, `Bearer scope="mcp:tools"`),
 		"challenge scope must be authoritative")
+	// This AS publishes no scopes_supported at all, so nothing is appended.
+}
+
+// offline_access must reach the authorization request from every
+// discovery-driven branch: neither PRM documents nor 401 challenges are
+// obliged to list it, and without it the AS issues no refresh token — the
+// bug that made every client restart pop a browser.
+func TestResolveScopesAppendsOfflineAccess(t *testing.T) {
+	offlineAS := &ASMetadata{ScopesSupported: []string{"openid", "profile", "offline_access"}, FromOIDC: true}
+
+	tests := []struct {
+		name      string
+		as        *ASMetadata
+		override  []string
+		prm       []string
+		challenge string
+		want      []string
+	}{
+		{name: "PRM scopes", as: offlineAS, prm: []string{"openid", "profile", "email"},
+			want: []string{"openid", "profile", "email", "offline_access"}},
+		{name: "challenge scope", as: offlineAS, challenge: `Bearer scope="mcp:tools"`,
+			want: []string{"mcp:tools", "offline_access"}},
+		{name: "OIDC default", as: offlineAS,
+			want: []string{"openid", "profile", "offline_access"}},
+		{name: "already present", as: offlineAS, prm: []string{"openid", "offline_access"},
+			want: []string{"openid", "offline_access"}},
+		// Appending a scope the AS never mentions risks invalid_scope.
+		{name: "not advertised", as: &ASMetadata{ScopesSupported: []string{"openid"}},
+			prm:  []string{"openid", "email"},
+			want: []string{"openid", "email"}},
+		{name: "explicit override wins verbatim", as: offlineAS, override: []string{"openid"},
+			prm: []string{"email"}, want: []string{"openid"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &Flow{Scopes: tt.override, Logf: t.Logf}
+			d := &discovery{AS: tt.as, PRMScopes: slices.Clone(tt.prm)}
+			got := f.resolveScopes(d, tt.challenge)
+			assert.Equal(t, tt.want, got)
+			// The result outlives discovery inside a stored Token, so it must
+			// own its memory rather than alias the cache.
+			if len(tt.override) == 0 && len(got) > 0 {
+				got[0] = "clobbered"
+			}
+			assert.Equal(t, tt.prm, d.PRMScopes, "cached discovery state must not be aliased or mutated")
+		})
+	}
 }
 
 func TestDiscoveryIssuerMismatchRejected(t *testing.T) {

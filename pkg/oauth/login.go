@@ -16,12 +16,12 @@ import (
 const loginTimeout = 5 * time.Minute
 
 // DefaultCallbackPort is the loopback callback port when none is configured;
-// it must be registered as a redirect URI in the IdP (vmkteam asksrv-cli precedent).
+// it must be registered as a redirect URI in the IdP.
 const DefaultCallbackPort = 18075
 
-// browserLogin runs Authorization Code + PKCE with a loopback callback
-// (ported from vmkteam asksrv-cli). Works while the bridge is live: browser
-// pops, the pending MCP request waits until the flow completes.
+// browserLogin runs Authorization Code + PKCE with a loopback callback. Works
+// while the bridge is live: browser pops, the pending MCP request waits until
+// the flow completes.
 func (f *Flow) browserLogin(ctx context.Context, d *discovery, scopes []string) (*Token, error) {
 	canonical, _, err := f.resourceKey()
 	if err != nil {
@@ -116,8 +116,14 @@ func (f *Flow) browserLogin(ctx context.Context, d *discovery, scopes []string) 
 		AccessToken:  tok.AccessToken,
 		RefreshToken: tok.RefreshToken,
 		Expiry:       tok.Expiry,
-		Scopes:       scopes,
+		Scopes:       grantedScopes(respScope(tok), scopes),
 	}, nil
+}
+
+// respScope digs the token response's `scope` out of the oauth2 extras.
+func respScope(tok *oauth2.Token) string {
+	s, _ := tok.Extra(paramScope).(string)
+	return s
 }
 
 // openBrowser launches the OS opener. The binaries are fixed and url is a
