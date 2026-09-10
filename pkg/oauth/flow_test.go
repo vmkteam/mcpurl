@@ -174,6 +174,60 @@ func TestBothExpiredSingleLogin(t *testing.T) {
 	assert.EqualValues(t, 1, logins.Load(), "login loop")
 }
 
+// A 401 on a token this process just refreshed is the server refusing a
+// credential that is valid by construction. A browser login produces the same
+// kind of token — it can only cost the user a window
+// (docs/tasks/02-401-body-discarded.md).
+func TestNoBrowserWhenFreshTokenRejected(t *testing.T) {
+	const challenge = `Bearer resource_metadata="https://x/.well-known/oauth-protected-resource", error="invalid_token"`
+	as := newFakeAS(t)
+	f := newTestFlow(t, as, t.TempDir())
+	seedToken(t, f)
+
+	var logins atomic.Int32
+	f.loginFn = func(context.Context, *discovery, []string) (*Token, error) {
+		logins.Add(1)
+		return &Token{AccessToken: "login-access", Expiry: time.Now().Add(time.Hour)}, nil
+	}
+
+	refreshed, err := f.Token(context.Background(), "", challenge)
+	require.NoError(t, err)
+	assert.Equal(t, "access-1", refreshed, "the stale stored token must be refreshed first")
+
+	_, err = f.Token(context.Background(), refreshed, challenge)
+	require.Error(t, err, "a rejected fresh token must end the ladder")
+	assert.Contains(t, err.Error(), "signing algorithm", "the message must be actionable")
+	assert.Contains(t, err.Error(), "invalid_token", "and quote what the server said")
+	assert.Zero(t, logins.Load(), "a browser cannot help here")
+}
+
+// The exception: a server calling the token *expired* describes something a
+// new token still fixes (clock skew), so that rung stays open.
+func TestExpiryChallengeStillEscalates(t *testing.T) {
+	const challenge = `Bearer error="invalid_token", error_description="The access token expired"`
+	as := newFakeAS(t)
+	f := newTestFlow(t, as, t.TempDir())
+	seedToken(t, f)
+
+	var logins atomic.Int32
+	f.loginFn = func(context.Context, *discovery, []string) (*Token, error) {
+		logins.Add(1)
+		return &Token{AccessToken: "login-access", Expiry: time.Now().Add(time.Hour)}, nil
+	}
+
+	refreshed, err := f.Token(context.Background(), "", challenge)
+	require.NoError(t, err)
+	tok, err := f.Token(context.Background(), refreshed, challenge)
+	require.NoError(t, err)
+	assert.Equal(t, "login-access", tok)
+	assert.EqualValues(t, 1, logins.Load())
+
+	// Still exactly one window: the login token being rejected too ends it.
+	_, err = f.Token(context.Background(), "login-access", challenge)
+	require.Error(t, err)
+	assert.EqualValues(t, 1, logins.Load(), "login loop")
+}
+
 // An AS that issues no refresh token condemns the user to a browser login per
 // restart. That must be said out loud at login, not discovered days later.
 func TestLoginWarnsWhenNoRefreshToken(t *testing.T) {

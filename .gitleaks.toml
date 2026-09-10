@@ -1,0 +1,14 @@
+# Default rules plus one narrow exemption.
+[extend]
+useDefault = true
+
+# mcpurl redacts JWT-shaped runs out of server-supplied text (pkg/redact), and
+# the tests for that have to carry fixtures that look exactly like a JWT — a
+# fixture that does not match the shape would test nothing. These are the
+# public jwt.io sample tokens: header {"alg":"RS256"}, payload {"sub":"user"},
+# no secret behind them. Scoped to the jwt rule and to _test.go so a real
+# credential committed anywhere else is still caught.
+[[allowlists]]
+description = "JWT-shaped fixtures in tests"
+targetRules = ["jwt"]
+paths = ['''.*_test\.go$''']

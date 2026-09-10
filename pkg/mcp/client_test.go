@@ -3,8 +3,11 @@ package mcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,6 +18,53 @@ import (
 
 func newTestClient(url string, tp TokenProvider) *Client {
 	return &Client{Endpoint: url, HTTP: &http.Client{}, Tokens: tp}
+}
+
+// logCapture stands in for the CLI's -v hook.
+type logCapture struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *logCapture) logf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *logCapture) text() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.lines, "\n")
+}
+
+func (l *logCapture) count(substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, line := range l.lines {
+		if strings.Contains(line, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+// authFailure is the authentik-behind-a-resource-server case verbatim: the
+// server explains the rejection in the body, and no token can fix it.
+const authFailure = `auth: invalid token: oidc: malformed jwt: unexpected signature algorithm "HS256"; expected ["RS256"]`
+
+// always401 serves that failure; requests may be nil when the count is not
+// what the test is about.
+func always401(requests *atomic.Int32) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		if requests != nil {
+			requests.Add(1)
+		}
+		w.Header().Set("WWW-Authenticate",
+			`Bearer resource_metadata="https://example.test/.well-known/oauth-protected-resource", error="invalid_token"`)
+		http.Error(w, authFailure, http.StatusUnauthorized)
+	}
 }
 
 func TestPostResponseModes(t *testing.T) {
@@ -51,24 +101,29 @@ func TestPostResponseModes(t *testing.T) {
 	}
 }
 
-// cyclingProvider escalates old → fresh → interactive, like oauth.Flow will.
-type cyclingProvider struct{ calls atomic.Int32 }
+// cyclingProvider escalates stored → refreshed → give up, like oauth.Flow
+// does: stored is what the "store" holds, and the refreshed token derives
+// from it.
+type cyclingProvider struct {
+	stored string
+	calls  atomic.Int32
+}
 
 func (p *cyclingProvider) Token(_ context.Context, rejected, _ string) (string, error) {
 	p.calls.Add(1)
 	switch rejected {
 	case "":
-		return "stale", nil
-	case "stale":
-		return "fresh", nil
+		return p.stored, nil
+	case p.stored:
+		return p.stored + "-refreshed", nil
 	default:
-		return "", errors.New("gave up")
+		return "", errors.New("server rejects freshly issued tokens; giving up")
 	}
 }
 
 func TestPost401Cycle(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer fresh" {
+		if r.Header.Get("Authorization") != "Bearer stale-refreshed" {
 			w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="https://x/.well-known/oauth-protected-resource"`)
 			w.WriteHeader(http.StatusUnauthorized)
 			return
@@ -77,7 +132,7 @@ func TestPost401Cycle(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newTestClient(srv.URL, &cyclingProvider{})
+	c := newTestClient(srv.URL, &cyclingProvider{stored: "stale"})
 	require.NoError(t, c.Post(context.Background(), []byte(`{}`), nil),
 		"expected recovery via token cycle")
 }
@@ -90,6 +145,155 @@ func TestPost401Fatal(t *testing.T) {
 
 	c := newTestClient(srv.URL, StaticToken("key"))
 	require.Error(t, c.Post(context.Background(), []byte(`{}`), nil))
+}
+
+// The server already wrote the diagnosis; -v must show it for EVERY 401 of
+// the cycle and the caller must receive it (02-401-body-discarded.md).
+func TestPost401SurfacesBodyAndChallenge(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(always401(&requests))
+	defer srv.Close()
+
+	var log logCapture
+	c := newTestClient(srv.URL, &cyclingProvider{stored: "stale"})
+	c.Logf = log.logf
+
+	err := c.Post(context.Background(), []byte(`{}`), nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "upstream HTTP 401")
+	assert.Contains(t, err.Error(), `unexpected signature algorithm "HS256"`,
+		"the server's own explanation must reach the caller")
+
+	assert.EqualValues(t, 2, requests.Load(), "stale, fresh, then the provider gave up")
+	assert.Equal(t, 2, log.count(`unexpected signature algorithm "HS256"`),
+		"every 401 body, not just the last one")
+	assert.Contains(t, log.text(), `error="invalid_token"`, "WWW-Authenticate must be visible")
+}
+
+// A provider that hands back the token the server just rejected has nothing
+// left to offer: replaying it would only fetch the same 401.
+func TestPost401ProviderRepeatsToken(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(always401(&requests))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, &stubbornProvider{})
+	err := c.Post(context.Background(), []byte(`{}`), nil)
+	var he *HTTPError
+	require.ErrorAs(t, err, &he)
+	assert.Equal(t, http.StatusUnauthorized, he.Status)
+	assert.Contains(t, he.Error(), "malformed jwt", "the 401 body must survive the retry loop")
+	assert.EqualValues(t, 1, requests.Load(), "no point replaying a rejected token")
+}
+
+// How far the ladder goes is the provider's call: 0.0.2 capped it at two
+// tokens, which made oauth.Flow's own give-up rung unreachable.
+func TestPost401LadderIsProviderDriven(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tok-3" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, &countingProvider{})
+	require.NoError(t, c.Post(context.Background(), []byte(`{}`), nil))
+}
+
+// …but a provider that never gives up must not turn a 401 into an endless
+// request loop.
+func TestPost401LadderBackstop(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(always401(&requests))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, &countingProvider{})
+	require.Error(t, c.Post(context.Background(), []byte(`{}`), nil))
+	assert.EqualValues(t, maxTokenCycles+1, requests.Load(), "ladder backstop")
+}
+
+// A binary body is reported by size and type — stderr and a JSON-RPC string
+// are no place for raw bytes.
+func TestFailedBinaryBodyIsNotDumped(t *testing.T) {
+	blob := []byte{0x00, 0x01, 0x02, 0xff, 0xfe}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write(blob)
+	}))
+	defer srv.Close()
+
+	var log logCapture
+	c := newTestClient(srv.URL, nil)
+	c.Logf = log.logf
+	err := c.Post(context.Background(), []byte(`{}`), nil)
+	require.Error(t, err)
+
+	const placeholder = "<5 bytes of application/octet-stream>"
+	assert.Contains(t, log.text(), placeholder)
+	assert.NotContains(t, log.text(), string(blob))
+	assert.Contains(t, err.Error(), placeholder)
+}
+
+// Gateways quote the credential they refused ("Jwt expired: eyJhbGci…").
+// Copying that body into -v output and into the message the MCP client
+// renders must not put an access token in a plaintext desktop log — the same
+// token is AES-256-GCM encrypted at rest.
+func TestEchoedTokenIsRedacted(t *testing.T) {
+	const jwt = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyIn0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		presented := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer error="invalid_token", error_description="Jwt expired: %s"`, presented))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintf(w, `{"error":"invalid_token","error_description":"Jwt expired: %s"}`, presented)
+	}))
+	defer srv.Close()
+
+	var log logCapture
+	c := newTestClient(srv.URL, &cyclingProvider{stored: jwt})
+	c.Logf = log.logf
+	err := c.Post(context.Background(), []byte(`{}`), nil)
+	require.Error(t, err)
+
+	assert.NotContains(t, log.text(), jwt, "-v leaked the token the server echoed")
+	assert.NotContains(t, err.Error(), jwt, "the error text leaks it to the MCP client")
+	assert.NotContains(t, log.text(), jwt+"-refreshed", "the refreshed token leaked too")
+	assert.Contains(t, log.text(), "[redacted JWT]")
+	assert.Contains(t, err.Error(), "Jwt expired", "the diagnosis itself must survive")
+}
+
+// The mcp counterpart of oauth.TestNoTokenMaterialInLogs: a full 401 cycle
+// must never print the bearer value it sent.
+func TestNoTokenMaterialInLogs(t *testing.T) {
+	const secret = "s3cr3t-access-token"
+	var requests atomic.Int32
+	srv := httptest.NewServer(always401(&requests))
+	defer srv.Close()
+
+	var log logCapture
+	c := newTestClient(srv.URL, &cyclingProvider{stored: secret})
+	c.Logf = log.logf
+	require.Error(t, c.Post(context.Background(), []byte(`{}`), nil))
+
+	assert.NotEmpty(t, log.text(), "the cycle must have logged something")
+	assert.NotContains(t, log.text(), secret, "debug output leaks token material")
+}
+
+// stubbornProvider always answers with the same token, rejected or not.
+type stubbornProvider struct{}
+
+func (stubbornProvider) Token(context.Context, string, string) (string, error) {
+	return "same", nil
+}
+
+// countingProvider issues an endless supply of distinct tokens.
+type countingProvider struct{ n atomic.Int32 }
+
+func (p *countingProvider) Token(context.Context, string, string) (string, error) {
+	return fmt.Sprintf("tok-%d", p.n.Add(1)), nil
 }
 
 func TestSessionCaptureAndHeaders(t *testing.T) {

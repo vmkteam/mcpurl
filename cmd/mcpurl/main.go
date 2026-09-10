@@ -21,6 +21,9 @@ import (
 
 const appName = "mcpurl"
 
+// clientHelp is the --client flag help, derived from the one supported list.
+var clientHelp = "target MCP client: " + strings.Join(app.Clients(), "|")
+
 var version = "dev" // stamped via -ldflags "-X main.version=…"
 
 // Exit codes (02-cli.md).
@@ -78,11 +81,14 @@ Usage:
   mcpurl claude-config <url | @profile>    print MCP client config snippets
   mcpurl install   [flags] <url | @profile>
                                            write the entry into the MCP client's
-                                           config (persists a profile for URLs)
-  mcpurl uninstall <name> [--client ...]   remove a previously installed entry
+                                           config (persists/updates the profile)
+  mcpurl uninstall <name | @profile> [--client ...]
+                                           remove the entry, its profile and its
+                                           stored tokens
   mcpurl version
 
-Profiles: ~/.config/mcpurl/config.toml (MCPURL_CONFIG overrides). Run
+Profiles: ~/.config/mcpurl/config.toml (MCPURL_CONFIG overrides). The "@" is
+optional everywhere — "@mysrv" and "mysrv" are the same target. Run
 'mcpurl <cmd> -h' for flags.`)
 }
 
@@ -251,7 +257,7 @@ func cmdLogout(args []string) int {
 func cmdInstall(args []string) int {
 	var o app.Options
 	fs := newFlagSet(appName+" install", &o)
-	client := fs.String("client", "claude-desktop", "target MCP client: claude-desktop|cursor|windsurf")
+	client := fs.String("client", "claude-desktop", clientHelp)
 	name := fs.String("name", "", "entry/profile name (default: profile name or host)")
 	dryRun := fs.Bool("dry-run", false, "print the resulting config without writing")
 	target, err := parseTarget(fs, args)
@@ -274,10 +280,10 @@ func cmdInstall(args []string) int {
 
 func cmdUninstall(args []string) int {
 	fs := flag.NewFlagSet(appName+" uninstall", flag.ContinueOnError)
-	client := fs.String("client", "claude-desktop", "target MCP client: claude-desktop|cursor|windsurf")
+	client := fs.String("client", "claude-desktop", clientHelp)
 	name, err := parseTarget(fs, args)
 	if err != nil || name == "" {
-		return fail(exitUsage, errors.New("usage: mcpurl uninstall <name> [--client ...]"))
+		return fail(exitUsage, errors.New("usage: mcpurl uninstall <name | @profile> [--client ...]"))
 	}
 	a, err := app.New(app.Options{}, os.Stderr)
 	if err != nil {

@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/vmkteam/mcpurl/pkg/atomicfile"
 )
 
 // Token is the stored value. Expiry is absolute (never a relative
@@ -82,28 +84,10 @@ func (s *FileStore) Save(key string, t *Token) error {
 	return writeFileAtomic(s.Dir, key+".json", data)
 }
 
-// writeFileAtomic writes data as dir/name with 0600 via tmp + rename.
+// writeFileAtomic writes data as dir/name with 0600 via tmp + rename. Token
+// files are ours alone, so the mode is fixed rather than preserved.
 func writeFileAtomic(dir, name string, data []byte) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, name+".tmp-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name()) //nolint:errcheck // no-op after successful rename
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), filepath.Join(dir, name))
+	return atomicfile.Write(filepath.Join(dir, name), data, 0o600)
 }
 
 func (s *FileStore) Delete(key string) error {

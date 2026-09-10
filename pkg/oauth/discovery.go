@@ -15,6 +15,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/vmkteam/mcpurl/pkg/redact"
 )
 
 const (
@@ -98,18 +100,58 @@ func requireHTTPS(raw string) error {
 
 var challengeParamRe = regexp.MustCompile(`(\w+)="([^"]*)"`)
 
-// parseChallenge extracts resource_metadata and scope from a
+// bearerChallenge is the parsed subset of a WWW-Authenticate: Bearer header:
+// discovery and scope resolution need the first two, the retry ladder and the
+// operator need the RFC 6750 §3.1 error pair.
+type bearerChallenge struct {
+	ResourceMetadata string // RFC 9728
+	Scope            string
+	Error            string
+	ErrorDescription string
+}
+
+// detail renders the error pair for a message ("" when the server named no
+// error). The challenge is what a server tells an unauthenticated client, so
+// nothing in it is secret by design — but error_description is free text, and
+// a gateway that pastes the rejected token into it would otherwise put that
+// token in an error the MCP client displays.
+func (c bearerChallenge) detail() string {
+	switch {
+	case c.Error == "":
+		return ""
+	case c.ErrorDescription == "":
+		return c.Error
+	default:
+		return redact.Tokens(c.Error + ": " + c.ErrorDescription)
+	}
+}
+
+// staleToken reports that the resource server called the credential expired
+// rather than foreign or malformed. Expiry is the one rejection a new token
+// can still fix (clock skew, an early-issued token), so it keeps the browser
+// rung of the ladder available — see Flow.obtain.
+func (c bearerChallenge) staleToken() bool {
+	return c.Error == "invalid_token" &&
+		strings.Contains(strings.ToLower(c.ErrorDescription), "expir")
+}
+
+// parseChallenge extracts the parameters mcpurl acts on from a
 // WWW-Authenticate: Bearer ... header value.
-func parseChallenge(h string) (resourceMetadata, scope string) {
+func parseChallenge(h string) bearerChallenge {
+	var c bearerChallenge
 	for _, m := range challengeParamRe.FindAllStringSubmatch(h, -1) {
 		switch m[1] {
 		case "resource_metadata":
-			resourceMetadata = m[2]
+			c.ResourceMetadata = m[2]
 		case paramScope:
-			scope = m[2]
+			c.Scope = m[2]
+		case "error":
+			c.Error = m[2]
+		case "error_description":
+			c.ErrorDescription = m[2]
 		}
 	}
-	return resourceMetadata, scope
+	return c
 }
 
 func (f *Flow) fetchJSON(ctx context.Context, rawURL string, out any) error {
@@ -146,7 +188,7 @@ func wellKnown(origin *url.URL, suffix, path string) string {
 // Returns the authorization server issuer plus PRM scopes.
 func (f *Flow) discoverPRM(ctx context.Context, canonical, challenge string) (issuer string, scopes []string, err error) {
 	endpoint, _ := url.Parse(canonical)
-	metaURL, _ := parseChallenge(challenge)
+	metaURL := parseChallenge(challenge).ResourceMetadata
 
 	candidates := []string{}
 	if metaURL != "" {
@@ -280,7 +322,7 @@ func (f *Flow) resolveScopes(d *discovery, challenge string) []string {
 		return f.Scopes // explicit override: verbatim, omissions included
 	}
 	supported := d.AS.ScopesSupported
-	if _, scope := parseChallenge(challenge); scope != "" {
+	if scope := parseChallenge(challenge).Scope; scope != "" {
 		return withOffline(supported, strings.Fields(scope))
 	}
 	if len(d.PRMScopes) > 0 {

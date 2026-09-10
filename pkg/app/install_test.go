@@ -13,7 +13,7 @@ import (
 )
 
 func TestClientConfigPath(t *testing.T) {
-	for _, client := range []string{"claude-desktop", "cursor", "windsurf"} {
+	for _, client := range knownClients {
 		p, err := clientConfigPath(client)
 		require.NoError(t, err, client)
 		assert.True(t, filepath.IsAbs(p), client)
@@ -51,7 +51,10 @@ func TestUpsertAndRemoveServerEntry(t *testing.T) {
 	assert.Contains(t, servers, "pencil", "existing server intact")
 	assert.Equal(t, entry, servers["acme"])
 
-	require.NoError(t, removeServerEntry(path, "acme"))
+	removed, ok, err := removeServerEntry(path, "acme")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "acme", entryProfile(removed), "removed entry reveals its profile")
 	data, err = os.ReadFile(path)
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(data, &root))
@@ -59,7 +62,9 @@ func TestUpsertAndRemoveServerEntry(t *testing.T) {
 	assert.NotContains(t, servers, "acme")
 	assert.Contains(t, servers, "pencil")
 
-	require.Error(t, removeServerEntry(path, "acme"), "double uninstall must fail")
+	_, ok, err = removeServerEntry(path, "acme")
+	require.NoError(t, err, "a second uninstall is not an error, just a no-op")
+	assert.False(t, ok)
 }
 
 func TestUpsertCreatesMissingFile(t *testing.T) {
@@ -109,15 +114,155 @@ func TestEnsureProfileAppendPreservesFile(t *testing.T) {
 	assert.Equal(t, "newsrv-cli", p.ClientID)
 	assert.Equal(t, []string{"openid", "roles"}, p.Scopes)
 
-	// Same name, different URL → refuse.
-	a2, err := New(Options{Target: "https://other.example/mcp", ClientID: "x"}, io.Discard)
+	// Same name, different URL → update in place, keeping flags not repeated.
+	a2, err := New(Options{Target: "https://other.example/mcp"}, io.Discard)
 	require.NoError(t, err)
-	require.ErrorContains(t, a2.ensureProfile(io.Discard, "newsrv", false), "different --name")
+	require.NoError(t, a2.ensureProfile(io.Discard, "newsrv", false))
+
+	cfg, err = Load("")
+	require.NoError(t, err)
+	p = cfg.Profiles["newsrv"]
+	assert.Equal(t, "https://other.example/mcp", p.URL, "install must replace the URL")
+	assert.Equal(t, "newsrv-cli", p.ClientID, "settings not passed again must survive")
+	assert.Equal(t, []string{"openid", "roles"}, p.Scopes)
+	assert.Len(t, cfg.Profiles, 2, "no duplicate [profiles.newsrv] block")
+	raw, err = os.ReadFile(a.cfg.Path)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), "[profiles.acme]", "other profiles untouched")
 
 	// Same name, same URL → reuse silently.
-	a3, err := New(Options{Target: "https://mcp.newsrv.example/mcp"}, io.Discard)
+	a3, err := New(Options{Target: "https://other.example/mcp"}, io.Discard)
 	require.NoError(t, err)
 	require.NoError(t, a3.ensureProfile(io.Discard, "newsrv", false))
+}
+
+// A rewrite must not drop a nested [profiles.<name>.headers] table: the user
+// hand-wrote it, install never sees it as a flag.
+func TestEnsureProfileUpdateKeepsHeaders(t *testing.T) {
+	writeConfig(t) // profile "acme" with an X-Team header
+	a, err := New(Options{Target: "https://acme.example/v2/mcp"}, io.Discard)
+	require.NoError(t, err)
+	require.NoError(t, a.ensureProfile(io.Discard, "acme", false))
+
+	cfg, err := Load("")
+	require.NoError(t, err)
+	p := cfg.Profiles["acme"]
+	assert.Equal(t, "https://acme.example/v2/mcp", p.URL)
+	assert.Equal(t, "acme-cli", p.ClientID)
+	assert.Equal(t, 18075, p.CallbackPort)
+	assert.Equal(t, map[string]string{"X-Team": "team-$MCPURL_TEST_SUFFIX"}, p.Headers,
+		"hand-written headers must survive the rewrite, unexpanded")
+
+	bak, err := os.ReadFile(a.cfg.Path + ".bak")
+	require.NoError(t, err)
+	assert.Contains(t, string(bak), "https://mcp.acme.example/mcp", ".bak holds the pre-edit config")
+}
+
+// uninstall is destructive and takes a bare name: a typo that hits a foreign
+// server entry must be called out, with the way back.
+func TestUninstallWarnsOnForeignEntry(t *testing.T) {
+	writeConfig(t)
+	t.Setenv("HOME", t.TempDir())
+	path, err := clientConfigPath("claude-desktop")
+	require.NoError(t, err)
+	require.NoError(t, upsertServerEntry(path, "pencil",
+		map[string]any{"command": "/usr/local/bin/pencil-mcp", "args": []any{"--x"}}, false, io.Discard))
+
+	var msg strings.Builder
+	a, err := New(Options{}, &msg)
+	require.NoError(t, err)
+	require.NoError(t, a.Uninstall("claude-desktop", "pencil"))
+	assert.Contains(t, msg.String(), "was not an mcpurl entry")
+	assert.Contains(t, msg.String(), ".bak")
+
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.Contains(t, cfg.Profiles, "acme", "an unrelated profile must not be touched")
+}
+
+// Uninstall is the full undo: entry + profile, with or without the "@".
+func TestUninstallRemovesEntryAndProfile(t *testing.T) {
+	writeConfig(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	a, err := New(Options{Target: "@acme"}, io.Discard)
+	require.NoError(t, err)
+	require.NoError(t, a.Install(io.Discard, "claude-desktop", "", false))
+
+	// A fresh App: uninstall runs in its own process.
+	a2, err := New(Options{}, io.Discard)
+	require.NoError(t, err)
+	require.NoError(t, a2.Uninstall("claude-desktop", "@acme"), "@ prefix must be accepted")
+
+	clientPath, err := clientConfigPath("claude-desktop")
+	require.NoError(t, err)
+	data, err := os.ReadFile(clientPath)
+	require.NoError(t, err)
+	var root map[string]any
+	require.NoError(t, json.Unmarshal(data, &root))
+	assert.NotContains(t, root["mcpServers"].(map[string]any), "acme")
+
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.NotContains(t, cfg.Profiles, "acme", "the profile must be gone too")
+}
+
+// The reported case: the entry was already removed, the profile lingered.
+func TestUninstallCleansLeftoverProfile(t *testing.T) {
+	writeConfig(t)
+	t.Setenv("HOME", t.TempDir()) // no client config at all
+	a, err := New(Options{}, io.Discard)
+	require.NoError(t, err)
+	require.NoError(t, a.Uninstall("claude-desktop", "acme"))
+
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.NotContains(t, cfg.Profiles, "acme")
+
+	// Nothing left anywhere → error, so a typo is not reported as success.
+	require.ErrorContains(t, a.Uninstall("claude-desktop", "acme"), "nothing to remove")
+}
+
+// A bare profile name is a profile, not a URL: install must reference the
+// existing one instead of minting a duplicate from the host label.
+func TestInstallBareNameReusesProfile(t *testing.T) {
+	writeConfig(t)
+	t.Setenv("HOME", t.TempDir())
+	a, err := New(Options{Target: "acme"}, io.Discard)
+	require.NoError(t, err)
+	require.NoError(t, a.Install(io.Discard, "claude-desktop", "", false))
+
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.Len(t, cfg.Profiles, 1, "no second profile from hostLabel()")
+	assert.Contains(t, cfg.Profiles, "acme")
+
+	path, err := clientConfigPath("claude-desktop")
+	require.NoError(t, err)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var root map[string]any
+	require.NoError(t, json.Unmarshal(data, &root))
+	entry := root["mcpServers"].(map[string]any)["acme"]
+	assert.Equal(t, "acme", entryProfile(entry), "the entry must point at @acme")
+}
+
+// install --name X @profile: the entry name differs from the profile name, so
+// uninstall must follow the entry's args to find the profile to drop.
+func TestUninstallFollowsEntryToProfile(t *testing.T) {
+	writeConfig(t)
+	t.Setenv("HOME", t.TempDir())
+	a, err := New(Options{Target: "@acme"}, io.Discard)
+	require.NoError(t, err)
+	require.NoError(t, a.Install(io.Discard, "cursor", "acme-prod", false))
+
+	a2, err := New(Options{}, io.Discard)
+	require.NoError(t, err)
+	require.NoError(t, a2.Uninstall("cursor", "acme-prod"))
+
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.NotContains(t, cfg.Profiles, "acme", "profile referenced by the entry must go")
 }
 
 func TestInstallDryRunWritesNothing(t *testing.T) {

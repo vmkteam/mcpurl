@@ -63,8 +63,9 @@ mcpurl login @mysrv     # browser → IdP → tokens in the keychain
 mcpurl token @mysrv     # print a live access token (auto-refresh) for curl
 ```
 
-Undo: `mcpurl uninstall mysrv` (profile and tokens stay; `mcpurl logout
-@mysrv` drops the tokens).
+Undo: `mcpurl uninstall mysrv` (or `@mysrv`) — it removes the client entry, the
+profile it references and the stored tokens. Re-running `install` on an
+existing name updates the profile in place.
 
 > **Claude Code doesn't need a bridge** — it connects directly:
 > `claude mcp add --transport http mysrv https://mcp.example.com/mcp`
@@ -80,13 +81,16 @@ mcpurl show   [name]                     list profiles / show one (no secrets)
 mcpurl claude-config <url | @profile>    print ready-to-paste client config
 mcpurl install   <url | @profile> [--client claude-desktop|cursor|windsurf]
                                          write the entry into the client config
-mcpurl uninstall <name> [--client ...]   remove a previously installed entry
+mcpurl uninstall <name | @profile> [--client ...]
+                                         remove the entry, its profile, tokens
 mcpurl version
 ```
 
 The bare-URL form works with zero config against any spec-compliant server —
 discovery does the rest. A profile only pins what discovery can't provide
-(client_id, a non-default callback port, scope overrides).
+(client_id, a non-default callback port, scope overrides). The `@` is a
+readability marker, not a requirement: `@mysrv` and `mysrv` are the same
+target in every command.
 
 ## Profiles
 
@@ -122,7 +126,7 @@ Resolution order for every setting: **flag > profile > discovery > default**.
 | `--no-sse` | false | Don't open the GET listening stream |
 | `--allow-http` | false | Permit plain http for non-loopback hosts |
 | `--timeout 10s` | `10s` | Connect/TLS timeout (no overall response timeout — tools can be slow) |
-| `-v` | false | Debug log to stderr, `Authorization` redacted |
+| `-v` | false | Debug log to stderr: statuses, challenges and failed-response bodies; never request headers or token material |
 
 ## How auth works
 

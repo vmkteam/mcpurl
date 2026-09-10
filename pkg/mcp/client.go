@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/vmkteam/mcpurl/pkg/redact"
 )
 
 // TokenProvider supplies the Authorization bearer value.
@@ -42,14 +44,41 @@ func (t StaticToken) Token(_ context.Context, rejected, _ string) (string, error
 	return string(t), nil
 }
 
+// Bounds on what a failed response contributes to logs and errors: enough for
+// a server's own diagnosis ("unexpected signature algorithm HS256"), small
+// enough for one stderr line and a JSON-RPC message. Nothing renders more
+// than bodyLineLimit, so capturing much beyond it only costs memory.
+const (
+	maxErrorBody  = 4 << 10  // captured into the error
+	bodyLineLimit = 512      // rendered on a debug line or in an error
+	maxDrain      = 64 << 10 // discarded to keep a connection reusable
+)
+
+// maxTokenCycles caps the 401 ladder. Terminating it is the TokenProvider's
+// job (refresh, escalate, then fail); this is only the backstop against a
+// provider that keeps issuing tokens the server keeps refusing.
+const maxTokenCycles = 4
+
 // HTTPError is returned by Post for non-2xx responses that the transport
-// layer does not resolve itself.
+// layer does not resolve itself. The body stays unexported: it holds raw wire
+// bytes, and everything that renders them has to redact first — a reader
+// outside this package would have no way to know that.
 type HTTPError struct {
-	Status int
-	Body   []byte
+	Status      int
+	ContentType string
+	body        []byte
 }
 
-func (e *HTTPError) Error() string { return fmt.Sprintf("upstream HTTP %d", e.Status) }
+// Error appends the server's own explanation when there is one: a bare
+// "upstream HTTP 401" sends the user to the server's logs for a diagnosis the
+// server already wrote (docs/tasks/02-401-body-discarded.md).
+func (e *HTTPError) Error() string {
+	msg := fmt.Sprintf("upstream HTTP %d", e.Status)
+	if s := bodySummary(e.ContentType, e.body); s != "" {
+		msg += ": " + s
+	}
+	return msg
+}
 
 // AuthError wraps a TokenProvider failure — maps to exit code 3.
 type AuthError struct{ Err error }
@@ -173,12 +202,14 @@ func (c *Client) token(ctx context.Context, rejected, challenge string) (string,
 }
 
 // doAuthed obtains a token, performs the request built by build, and cycles
-// the TokenProvider on 401 (up to two fresh tokens — refresh, then
-// interactive). Returns the first non-401 response.
+// the TokenProvider on 401 until the provider stops handing out new tokens.
+// How far the ladder goes — refresh, interactive login, give up — is the
+// provider's decision, not a fixed attempt count. Returns the first non-401
+// response, or the last 401 with its body intact.
 func (c *Client) doAuthed(ctx context.Context, build func(token string) (*http.Request, error)) (*http.Response, error) {
 	token, err := c.token(ctx, "", "")
 	if err != nil {
-		return nil, &AuthError{err}
+		return nil, &AuthError{Err: err}
 	}
 	for attempt := 0; ; attempt++ {
 		req, err := build(token)
@@ -189,21 +220,122 @@ func (c *Client) doAuthed(ctx context.Context, build func(token string) (*http.R
 		if err != nil {
 			return nil, fmt.Errorf("%s %s: %w", req.Method, c.Endpoint, err)
 		}
-		c.debugf("%s → %d %s", req.Method, resp.StatusCode, resp.Header.Get("Content-Type"))
-		if resp.StatusCode != http.StatusUnauthorized || c.Tokens == nil || attempt >= 2 {
+		if resp.StatusCode/100 == 2 {
+			c.logResponse(req.Method, resp, nil)
 			return resp, nil
 		}
-		challenge := resp.Header.Get("WWW-Authenticate")
-		drain(resp)
+		// Buffer before anything reads: the log line here and the *HTTPError
+		// a caller builds later must both see the body, and a response body
+		// reads exactly once — that is how the 401 explanations disappeared.
+		body := captureBody(resp)
+		c.logResponse(req.Method, resp, body)
+		if resp.StatusCode != http.StatusUnauthorized || c.Tokens == nil || attempt >= maxTokenCycles {
+			return resp, nil
+		}
+
 		c.debugf("%s 401, cycling token (attempt %d)", req.Method, attempt+1)
 		rejected := token
 		if rejected == "" {
 			rejected = "-" // anonymous rejection marker, see TokenProvider
 		}
-		if token, err = c.token(ctx, rejected, challenge); err != nil {
-			return nil, &AuthError{err}
+		next, terr := c.token(ctx, rejected, resp.Header.Get("WWW-Authenticate"))
+		if terr != nil {
+			// The provider gave up. Carry the 401 along: the server's own
+			// diagnosis is the half of the message a user can act on.
+			return nil, &AuthError{fmt.Errorf("%w (%w)", terr, httpError(resp, body))}
 		}
+		if next == token {
+			// Contract violation (a rejected token must not come back);
+			// replaying it would only fetch the same 401.
+			c.debugf("token provider re-offered the rejected token, not retrying")
+			return resp, nil
+		}
+		token = next
 	}
+}
+
+// capturedBody is a body already buffered by captureBody. The marker keeps a
+// second capture on the same response from re-reading (and re-allocating) the
+// bytes the first one installed.
+type capturedBody struct {
+	io.Reader
+	buf []byte
+}
+
+func (capturedBody) Close() error { return nil }
+
+// captureBody buffers a bounded prefix of a failed response and puts it back
+// as the body: the connection is released immediately and every later reader
+// — debug log, newHTTPError, drain — sees the same bytes. The remainder is
+// discarded rather than abandoned, so the connection returns to the idle pool
+// instead of being torn down right before the retry that follows a 401.
+func captureBody(resp *http.Response) []byte {
+	if c, ok := resp.Body.(capturedBody); ok {
+		return c.buf
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+	io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrain)) //nolint:errcheck // keep-alive hygiene
+	resp.Body.Close()                                        //nolint:errcheck // read side only
+	resp.Body = capturedBody{bytes.NewReader(body), body}
+	return body
+}
+
+// logResponse puts everything one response says on one debug line: status,
+// content type, and — for a failed one, whose body the caller has captured —
+// the challenge and a bounded body prefix. RFC 6750 §3 defines
+// WWW-Authenticate as what the server tells an *unauthenticated* client: it
+// carries no secret and must not be redacted.
+func (c *Client) logResponse(method string, resp *http.Response, body []byte) {
+	if c.Logf == nil {
+		return
+	}
+	ct := resp.Header.Get("Content-Type")
+	line := fmt.Sprintf("%s → %d %s", method, resp.StatusCode, ct)
+	if challenge := resp.Header.Get("WWW-Authenticate"); challenge != "" {
+		// The challenge itself is public, but its error_description is free
+		// text a gateway may have pasted the rejected token into.
+		line += ", WWW-Authenticate: " + redact.Tokens(challenge)
+	}
+	if s := bodySummary(ct, body); s != "" {
+		line += ", body: " + s
+	}
+	c.debugf("%s", line)
+}
+
+// bodySummary renders a failed response body for a single-line log record or
+// error message: whitespace-collapsed and truncated for textual types, a
+// size/type placeholder for everything else — binary has no business on
+// stderr, let alone inside a JSON-RPC string.
+//
+// The body is the server's text, not ours: it goes through redact.Tokens
+// before anyone sees it, because gateways quote the credential they refused.
+// Redaction runs before truncation so a token cannot be split across the cut.
+func bodySummary(contentType string, body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	if contentType == "" {
+		contentType = http.DetectContentType(body) // sloppy server, sniff it
+	}
+	if !textualType(contentType) {
+		return fmt.Sprintf("<%d bytes of %s>", len(body), contentType)
+	}
+	s := strings.Join(strings.Fields(string(body)), " ") // collapses newlines
+	s = redact.Tokens(s)
+	if len(s) > bodyLineLimit {
+		s = s[:bodyLineLimit] + "…"
+	}
+	return strings.ToValidUTF8(s, "") // a cut rune, or plain junk, is not output
+}
+
+// textualType reports whether a Content-Type is safe to echo: text/*, JSON
+// and any structured +json syntax (application/problem+json et al).
+func textualType(contentType string) bool {
+	mt := strings.ToLower(strings.TrimSpace(contentType))
+	if i := strings.IndexByte(mt, ';'); i >= 0 {
+		mt = strings.TrimSpace(mt[:i])
+	}
+	return strings.HasPrefix(mt, "text/") || mt == "application/json" || strings.HasSuffix(mt, "+json")
 }
 
 // Post sends one client→server JSON-RPC message. Every resulting
@@ -274,11 +406,17 @@ func (c *Client) consumePost(resp *http.Response, deliver func([]byte)) error {
 	}
 }
 
-// newHTTPError captures up to 64 KB of body into the error and closes it.
+// newHTTPError captures a bounded body into the error and closes the response.
 func newHTTPError(resp *http.Response) *HTTPError {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	resp.Body.Close()
-	return &HTTPError{Status: resp.StatusCode, Body: body}
+	return httpError(resp, captureBody(resp))
+}
+
+func httpError(resp *http.Response, body []byte) *HTTPError {
+	return &HTTPError{
+		Status:      resp.StatusCode,
+		ContentType: resp.Header.Get("Content-Type"),
+		body:        body,
+	}
 }
 
 // deliverCompact validates a JSON payload, compacts it if it contains
@@ -412,7 +550,7 @@ func (c *Client) DeleteSession(ctx context.Context) {
 }
 
 func drain(resp *http.Response) {
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10)) //nolint:errcheck // keep-alive drain
+	io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrain)) //nolint:errcheck // keep-alive drain
 	resp.Body.Close()
 }
 

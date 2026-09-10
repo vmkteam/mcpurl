@@ -179,6 +179,9 @@ func (a *App) tokenProvider() mcp.TokenProvider {
 	return a.flow()
 }
 
+// store is the token backend for this run (--no-keychain forces files).
+func (a *App) store() oauth.Store { return oauth.NewStore(a.opts.NoKeychain) }
+
 func (a *App) flow() *oauth.Flow {
 	return &oauth.Flow{
 		Endpoint:     a.prof.URL,
@@ -186,7 +189,7 @@ func (a *App) flow() *oauth.Flow {
 		Scopes:       a.prof.Scopes,
 		Issuer:       a.prof.Issuer,
 		CallbackPort: a.prof.CallbackPort,
-		Store:        oauth.NewStore(a.opts.NoKeychain),
+		Store:        a.store(),
 		HTTP:         a.httpc,
 		Logf:         a.logf,
 		Warnf:        a.warnf,
