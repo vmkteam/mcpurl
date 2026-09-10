@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"net/url"
 	"slices"
 	"strings"
 
@@ -61,14 +60,14 @@ func (a *App) Logout() error {
 	if a.prof.ClientID == "" {
 		return errors.New("logout needs a clientID (profile or --client-id) to locate the stored token")
 	}
-	a.dropTokens(oauth.NewStore(a.opts.NoKeychain), a.prof)
+	a.dropTokens(a.store(), a.prof)
 	return nil
 }
 
 // LogoutAll drops tokens for every configured profile plus file-backend
 // leftovers from bare-URL runs; needs no target resolution.
 func (a *App) LogoutAll() error {
-	store := oauth.NewStore(a.opts.NoKeychain)
+	store := a.store()
 	for _, name := range a.cfg.Names() {
 		a.dropTokens(store, a.cfg.Profiles[name])
 	}
@@ -76,6 +75,9 @@ func (a *App) LogoutAll() error {
 	return nil
 }
 
+// dropTokens deletes the stored token for p. The deletion is unconditional
+// (an unreadable leftover must go too), but nothing is reported when there was
+// nothing stored — "dropped tokens" for an empty store reads as a lie.
 func (a *App) dropTokens(store oauth.Store, p Profile) {
 	if p.URL == "" || p.ClientID == "" {
 		return
@@ -84,11 +86,17 @@ func (a *App) dropTokens(store oauth.Store, p Profile) {
 	if err != nil {
 		return
 	}
+	// Load first only to decide whether to report: it costs one os.ReadFile
+	// for the "nothing stored" case (both backends answer ErrNotFound before
+	// touching the keyring), and Delete must stay a no-op either way.
+	_, loadErr := store.Load(key)
 	if err := store.Delete(key); err != nil {
 		a.warnf("logout %s: %v", p.Name, err)
 		return
 	}
-	fmt.Fprintf(a.msg, "dropped tokens for %s\n", p.URL)
+	if !errors.Is(loadErr, oauth.ErrNotFound) {
+		fmt.Fprintf(a.msg, "dropped tokens for %s\n", p.URL)
+	}
 }
 
 // Show writes the profile list (name == "") or one profile without secrets.
@@ -107,8 +115,7 @@ func (a *App) Show(w io.Writer, name string) error {
 	if err != nil {
 		return err
 	}
-	name = strings.TrimPrefix(name, "@")
-	fmt.Fprintf(w, "profile:      @%s\nurl:          %s\n", name, p.URL)
+	fmt.Fprintf(w, "profile:      @%s\nurl:          %s\n", p.Name, p.URL)
 	if p.ClientID != "" {
 		fmt.Fprintf(w, "clientID:     %s\n", p.ClientID)
 	}
@@ -142,11 +149,13 @@ func (a *App) ClaudeConfig(w io.Writer, target, name string) error {
 		name = prof.Name
 	}
 	if name == "" {
-		if u, err := url.Parse(prof.URL); err == nil {
-			name = strings.Split(u.Hostname(), ".")[0]
-		} else {
-			name = "mcp"
-		}
+		name = hostLabel(prof.URL) // same default install uses
+	}
+	// The snippet is config, not shorthand: spell the profile reference the
+	// way install writes it, "@" included, whichever form was typed.
+	arg := target
+	if prof.Name != "" {
+		arg = "@" + prof.Name
 	}
 	fmt.Fprintf(w, `# Claude Desktop / Cursor / Windsurf (stdio bridge):
 {
@@ -159,6 +168,6 @@ func (a *App) ClaudeConfig(w io.Writer, target, name string) error {
 }
 # Claude Code (no bridge needed — connects directly):
 #   claude mcp add --transport http %s %s
-`, name, target, name, prof.URL)
+`, name, arg, name, prof.URL)
 	return nil
 }

@@ -5,6 +5,7 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"net/url"
@@ -70,34 +71,46 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// Get looks up a profile by name (with or without the "@" prefix).
+// Get looks up a stored profile by name (with or without the "@" prefix).
+// Unlike Resolve it never accepts a URL — the caller means a profile.
 func (c *Config) Get(name string) (Profile, error) {
 	name = strings.TrimPrefix(name, "@")
 	p, ok := c.Profiles[name]
 	if !ok {
-		return Profile{}, fmt.Errorf("profile %q not found in %s (known: %s)",
+		return Profile{}, fmt.Errorf("%q is not a profile in %s (known: %s)",
 			name, c.Path, strings.Join(c.Names(), ", "))
 	}
 	return p, nil
 }
 
-// Resolve maps a CLI target ("@name" or a bare URL) to a Profile.
+// Resolve maps a CLI target to a Profile. The target is an http(s) URL, or a
+// profile name written either way: the "@" is a readability marker, never a
+// requirement — every command accepts both spellings.
 func (c *Config) Resolve(target string) (Profile, error) {
-	if strings.HasPrefix(target, "@") {
-		p, err := c.Get(target)
-		if err != nil {
-			return Profile{}, err
-		}
-		if p.URL == "" {
-			return Profile{}, fmt.Errorf("profile %q has no url", p.Name)
-		}
-		return p, nil
+	if isHTTPURL(target) {
+		return Profile{Name: "", URL: target}, nil
 	}
+	if strings.TrimPrefix(target, "@") == "" {
+		return Profile{}, errors.New("empty target: want a profile name or an http(s) URL")
+	}
+	p, err := c.Get(target)
+	if err != nil {
+		// Name both readings: a mistyped URL lands here too, and the profile
+		// lookup alone would send the user looking in the wrong file.
+		return Profile{}, fmt.Errorf("%w and not an http(s) URL", err)
+	}
+	if p.URL == "" {
+		return Profile{}, fmt.Errorf("profile %q has no url", p.Name)
+	}
+	return p, nil
+}
+
+// isHTTPURL reports whether target is a usable http(s) endpoint rather than a
+// profile name. A scheme is required: "example.com/mcp" is ambiguous, and
+// treating it as a profile name yields the message that lists both readings.
+func isHTTPURL(target string) bool {
 	u, err := url.Parse(target)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return Profile{}, fmt.Errorf("target %q is neither @profile nor an http(s) URL", target)
-	}
-	return Profile{Name: "", URL: target}, nil
+	return err == nil && u.Host != "" && (u.Scheme == "http" || u.Scheme == "https")
 }
 
 // Names returns profile names, sorted.

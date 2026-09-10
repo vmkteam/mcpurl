@@ -51,6 +51,26 @@ func TestLoadAndResolve(t *testing.T) {
 	require.Error(t, err, "garbage target")
 }
 
+// The "@" is a readability marker, not a requirement: every command takes a
+// bare profile name too (that asymmetry is what made `uninstall @x` fail).
+func TestResolveAcceptsBareName(t *testing.T) {
+	cfg, err := Load(writeSample(t))
+	require.NoError(t, err)
+
+	bare, err := cfg.Resolve("acme")
+	require.NoError(t, err)
+	at, err := cfg.Resolve("@acme")
+	require.NoError(t, err)
+	assert.Equal(t, at, bare, "both spellings must resolve identically")
+
+	// A mistyped URL lands in the same branch, so the message must name both
+	// readings instead of just "profile not found".
+	_, err = cfg.Resolve("mcp.example.com/mcp")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a profile")
+	assert.Contains(t, err.Error(), "http(s) URL")
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	cfg, err := Load(filepath.Join(t.TempDir(), "absent.toml"))
 	require.NoError(t, err)
