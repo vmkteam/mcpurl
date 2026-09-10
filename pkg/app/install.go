@@ -304,6 +304,10 @@ func (a *App) editProfileBlock(name, block string) error {
 // lives in one place.
 func replaceConfig(path string, original, data []byte) error {
 	if original != nil {
+		// #nosec G703 -- path is the config file mcpurl was pointed at:
+		// MCPURL_CONFIG, or a client's own fixed location. Managing that file
+		// (and putting the backup beside it) is the feature, which is why
+		// G304 is excluded in .github/workflows/ci.yml for the same reason.
 		if err := os.WriteFile(path+".bak", original, 0o600); err != nil {
 			return fmt.Errorf("writing backup: %w", err)
 		}
