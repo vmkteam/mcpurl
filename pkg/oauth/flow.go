@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/vmkteam/mcpurl/internal/redact"
 )
 
 const expirySkew = 60 * time.Second // proactive refresh window (04-oauth.md)
@@ -152,6 +154,18 @@ func (f *Flow) obtain(ctx context.Context, key, canonical, rejected, challenge s
 		return stored.AccessToken, nil
 	}
 
+	ch := parseChallenge(challenge)
+
+	// A 401 on a token this process just minted is not a stale credential: the
+	// authorization server issues it happily and the resource server refuses
+	// it (signing algorithm, audience/resource, issuer, clock). Another
+	// refresh returns the same kind of token, and a browser login returns the
+	// same kind again — the only thing an escalation buys the user here is a
+	// pointless login window (docs/tasks/02-401-body-discarded.md).
+	if f.selfIssued(rejected) && !ch.staleToken() {
+		return "", rejectionError(ch)
+	}
+
 	d, err := f.discover(ctx, challenge)
 	if err != nil {
 		return "", err
@@ -180,15 +194,35 @@ func (f *Flow) obtain(ctx context.Context, key, canonical, rejected, challenge s
 		}
 	}
 
-	// Interactive login — exactly once per rejection cycle.
+	// Interactive login — at most one browser window per process, whatever the
+	// challenge claims.
 	if rejected != "" && rejected == f.lastLoggedIn {
-		return "", errors.New("server rejects freshly issued tokens; giving up (check client/audience config)")
+		return "", rejectionError(ch)
 	}
 	t, err := f.loginAndSave(ctx, key, d, challenge)
 	if err != nil {
 		return "", err
 	}
 	return t.AccessToken, nil
+}
+
+// selfIssued reports that the rejected token is one this process obtained —
+// out of a refresh or a login — rather than one loaded from the store. The
+// anonymous marker "-" (see mcp.TokenProvider) never matches: both fields
+// only ever hold real access tokens.
+func (f *Flow) selfIssued(rejected string) bool {
+	return rejected != "" && (rejected == f.lastRefreshed || rejected == f.lastLoggedIn)
+}
+
+// rejectionError names the disagreement instead of the symptom: the token is
+// structurally valid by construction, so the two servers disagree about what
+// a valid token looks like.
+func rejectionError(ch bearerChallenge) error {
+	msg := "server rejects freshly issued tokens; giving up — the authorization server and the resource server disagree (check the token signing algorithm, the audience/resource, and the issuer)"
+	if d := ch.detail(); d != "" {
+		msg += "; server said: " + d
+	}
+	return errors.New(msg)
 }
 
 // loginAndSave runs the interactive flow (test hook aware), stamps and
@@ -342,12 +376,23 @@ func (f *Flow) probeChallenge(ctx context.Context, canonical string) string {
 	if err != nil {
 		return ""
 	}
-	drainBody(resp)
-	return resp.Header.Get("WWW-Authenticate")
+	challenge := resp.Header.Get("WWW-Authenticate")
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, probeBodyLimit))
+	resp.Body.Close()
+	// The probe's own 401 explains as much as the bridge's does — dropping it
+	// is what sends users to the server's logs for a diagnosis they were
+	// already handed. %q keeps it to one line and escapes anything binary;
+	// only the logged copy is redacted, discovery still gets the raw header.
+	f.debugf("challenge probe → %d, WWW-Authenticate: %q, body: %.512q",
+		resp.StatusCode, redact.Tokens(challenge), redact.Tokens(string(body)))
+	return challenge
 }
+
+// probeBodyLimit doubles as the keep-alive drain bound (see drainBody).
+const probeBodyLimit = 4 << 10
 
 // drainBody discards a bounded remainder and closes (keep-alive hygiene).
 func drainBody(resp *http.Response) {
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	io.Copy(io.Discard, io.LimitReader(resp.Body, probeBodyLimit))
 	resp.Body.Close()
 }

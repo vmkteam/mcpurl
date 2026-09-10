@@ -214,12 +214,15 @@ func (b *Bridge) handleInitialize(ctx context.Context, line []byte, protocolVer 
 		b.writeOut(msg)
 	})
 	if err != nil {
+		// Answer first, exit after: an MCP client that only renders the error
+		// surface must still learn why the handshake failed — including when
+		// auth is what failed.
+		b.logf("initialize failed: %v", err)
+		b.synthesizeError(line, err)
 		var ae *AuthError
 		if errors.As(err, &ae) {
 			return err // exit 3: auth is required and unobtainable
 		}
-		b.logf("initialize failed: %v", err)
-		b.synthesizeError(line, err)
 		return fmt.Errorf("initialize: %w", err)
 	}
 	b.handshakeMu.Lock()
@@ -271,11 +274,9 @@ func (b *Bridge) send(ctx context.Context, msg []byte) {
 	}
 
 	// warn, not debug: the operator must learn about upstream failures
-	// (rate limits, 5xx) from the client's log even without -v.
+	// (rate limits, 5xx) from the client's log even without -v. The upstream
+	// body travels inside err (HTTPError.Error), so no separate body line.
 	b.warnf("POST failed: %v", err)
-	if errors.As(err, &he) && len(he.Body) > 0 {
-		b.logf("upstream body: %s", he.Body[:min(len(he.Body), 2048)])
-	}
 	b.synthesizeError(msg, err)
 }
 
@@ -381,15 +382,14 @@ func (b *Bridge) synthesizeError(msg []byte, cause error) {
 	if !isRequest {
 		return
 	}
-	text := "upstream error"
-	var he *HTTPError
-	if errors.As(cause, &he) {
-		text = fmt.Sprintf("upstream HTTP %d", he.Status)
-	}
+	// The error's own text is the message: HTTPError/AuthError already render
+	// the status plus whatever the server said on one line, and a transport
+	// or stream failure says more than a constant would. This is the only
+	// thing an MCP client gets to show.
 	out, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      meta.ID,
-		"error":   map[string]any{"code": -32603, "message": text},
+		"error":   map[string]any{"code": -32603, "message": cause.Error()},
 	})
 	if err != nil {
 		return

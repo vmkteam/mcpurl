@@ -36,13 +36,30 @@ func TestCanonicalize(t *testing.T) {
 }
 
 func TestParseChallenge(t *testing.T) {
-	rm, scope := parseChallenge(`Bearer resource_metadata="https://x/.well-known/oauth-protected-resource", scope="openid mcp", error="invalid_token"`)
-	assert.Equal(t, "https://x/.well-known/oauth-protected-resource", rm)
-	assert.Equal(t, "openid mcp", scope)
+	c := parseChallenge(`Bearer resource_metadata="https://x/.well-known/oauth-protected-resource", scope="openid mcp", error="invalid_token", error_description="token is expired"`)
+	assert.Equal(t, "https://x/.well-known/oauth-protected-resource", c.ResourceMetadata)
+	assert.Equal(t, "openid mcp", c.Scope)
+	assert.Equal(t, "invalid_token", c.Error)
+	assert.Equal(t, "token is expired", c.ErrorDescription)
+	assert.Equal(t, "invalid_token: token is expired", c.detail())
+	assert.True(t, c.staleToken())
 
-	rm, scope = parseChallenge("")
-	assert.Empty(t, rm)
-	assert.Empty(t, scope)
+	assert.Empty(t, parseChallenge("").detail())
+	assert.Equal(t, bearerChallenge{}, parseChallenge(""))
+
+	// The authentik case: invalid_token with no description at all — a
+	// rejection the client cannot fix by getting another token.
+	c = parseChallenge(`Bearer resource_metadata="https://x/.well-known/oauth-protected-resource", error="invalid_token"`)
+	assert.Equal(t, "invalid_token", c.detail())
+	assert.False(t, c.staleToken())
+
+	// error_description is free text: a gateway pasting the refused token into
+	// it must not reach the error the MCP client renders (rejectionError).
+	const jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.dBjftJeZ4CVP-mB92K27uh"
+	c = parseChallenge(`Bearer error="invalid_token", error_description="Jwt expired: ` + jwt + `"`)
+	assert.NotContains(t, c.detail(), jwt)
+	assert.NotContains(t, rejectionError(c).Error(), jwt)
+	assert.Contains(t, c.detail(), "Jwt expired: [redacted JWT]")
 }
 
 // full chain: PRM at path-insertion well-known → Keycloak-style OIDC

@@ -1,9 +1,14 @@
 package app
 
 import (
+	"bytes"
+	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -71,6 +76,32 @@ func TestNewWithoutTarget(t *testing.T) {
 	assert.NoError(t, a.Show(io.Discard, "acme"), "Show without target resolution") //nolint:testifylint // value check
 	// claude-config must not enforce the scheme check — it only renders.
 	assert.NoError(t, a.ClaudeConfig(io.Discard, "@acme", "")) //nolint:testifylint // value check
+}
+
+// A server that refuses the credential ends the run on exit code 3, with its
+// own explanation both in the error the CLI prints and in the JSON-RPC error
+// the MCP client shows (docs/tasks/02-401-body-discarded.md).
+func TestBridgeAuthFailure(t *testing.T) {
+	writeConfig(t)
+	t.Setenv("MCPURL_TEST_BEARER", "static-key")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+		http.Error(w, `auth: invalid token: oidc: malformed jwt: unexpected signature algorithm "HS256"`,
+			http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	a, err := New(Options{Target: srv.URL, BearerEnv: "MCPURL_TEST_BEARER"}, io.Discard)
+	require.NoError(t, err)
+
+	const initReq = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`
+	var out bytes.Buffer
+	err = a.Bridge(context.Background(), strings.NewReader(initReq+"\n"), &out)
+	require.Error(t, err)
+	assert.True(t, IsAuthError(err), "must map to exit code 3")
+	assert.Contains(t, err.Error(), "malformed jwt", "the server's diagnosis must reach stderr")
+	assert.Contains(t, out.String(), `"code":-32603`)
+	assert.Contains(t, out.String(), "malformed jwt", "…and the MCP client")
 }
 
 func TestCheckScheme(t *testing.T) {

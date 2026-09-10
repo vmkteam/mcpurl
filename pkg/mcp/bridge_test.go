@@ -320,7 +320,33 @@ func TestBridgeErrorSynthesis(t *testing.T) {
 	l := h.expect(`"code":-32603`)
 	assert.Contains(t, l, `"id":9`)
 	assert.Contains(t, l, "upstream HTTP 500")
+	assert.Contains(t, l, "boom", "the upstream body belongs in the message the client shows")
 	h.close()
+}
+
+// A handshake that dies on auth must still answer the pending initialize —
+// with the reason. Exiting silently leaves the MCP client staring at a
+// process that vanished (02-401-body-discarded.md).
+func TestBridgeInitializeAuthFailureAnswers(t *testing.T) {
+	srv := httptest.NewServer(always401(nil))
+	defer srv.Close()
+
+	h := newHarness(t, srv.URL, StaticToken("key"))
+	h.send(initReq)
+	l := h.expect(`"code":-32603`)
+	assert.Contains(t, l, `"id":1`)
+	assert.Contains(t, l, "upstream HTTP 401")
+	assert.Contains(t, l, "malformed jwt")
+
+	h.in.Close()
+	select {
+	case err := <-h.done:
+		var ae *AuthError
+		require.ErrorAs(t, err, &ae, "must classify as auth failure (exit 3)")
+		assert.Contains(t, ae.Error(), "malformed jwt", "and carry the reason to stderr")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not exit after the failed handshake")
+	}
 }
 
 func TestBridgeGetStreamNotifications(t *testing.T) {
