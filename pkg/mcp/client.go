@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vmkteam/mcpurl/internal/redact"
+	"github.com/vmkteam/mcpurl/pkg/redact"
 )
 
 // TokenProvider supplies the Authorization bearer value.

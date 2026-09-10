@@ -16,7 +16,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/vmkteam/mcpurl/internal/redact"
+	"github.com/vmkteam/mcpurl/pkg/redact"
 )
 
 const (

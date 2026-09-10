@@ -18,7 +18,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/vmkteam/mcpurl/internal/atomicfile"
+	"github.com/vmkteam/mcpurl/pkg/atomicfile"
 )
 
 // knownClients is the single list of MCP clients install/uninstall know how
@@ -308,7 +308,7 @@ func replaceConfig(path string, original, data []byte) error {
 			return fmt.Errorf("writing backup: %w", err)
 		}
 	}
-	return atomicfile.Write(path, data, atomicfile.Mode(path, 0o600))
+	return atomicfile.Write(path, data, 0o600)
 }
 
 // profileTOML renders the block: only what discovery can't provide, plus any

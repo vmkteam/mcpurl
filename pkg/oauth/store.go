@@ -13,7 +13,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/vmkteam/mcpurl/internal/atomicfile"
+	"github.com/vmkteam/mcpurl/pkg/atomicfile"
 )
 
 // Token is the stored value. Expiry is absolute (never a relative

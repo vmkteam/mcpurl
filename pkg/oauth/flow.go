@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vmkteam/mcpurl/internal/redact"
+	"github.com/vmkteam/mcpurl/pkg/redact"
 )
 
 const expirySkew = 60 * time.Second // proactive refresh window (04-oauth.md)
