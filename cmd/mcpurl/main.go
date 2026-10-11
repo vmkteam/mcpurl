@@ -75,7 +75,7 @@ func usage() {
 Usage:
   mcpurl [flags] <url | @profile>          run the stdio bridge (default)
   mcpurl login  [flags] <url | @profile>   interactive browser PKCE login
-  mcpurl logout <url | @profile | --all>   drop stored tokens
+  mcpurl logout <url | @profile | --all>   drop stored tokens and client registration
   mcpurl token  [flags] <url | @profile>   print access_token (auto-refresh)
   mcpurl show   [name]                     list profiles / show one (no secrets)
   mcpurl claude-config <url | @profile>    print MCP client config snippets

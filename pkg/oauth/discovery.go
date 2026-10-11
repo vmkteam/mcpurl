@@ -38,6 +38,7 @@ type ASMetadata struct {
 	Issuer                        string   `json:"issuer"`
 	AuthorizationEndpoint         string   `json:"authorization_endpoint"`
 	TokenEndpoint                 string   `json:"token_endpoint"`
+	RegistrationEndpoint          string   `json:"registration_endpoint"` // RFC 7591; "" = no DCR
 	ScopesSupported               []string `json:"scopes_supported"`
 	CodeChallengeMethodsSupported []string `json:"code_challenge_methods_supported"`
 
@@ -293,7 +294,7 @@ func (f *Flow) discover(ctx context.Context, challenge string) (*discovery, erro
 		return f.disco, nil
 	}
 
-	canonical, _, err := f.resourceKey()
+	canonical, err := Canonicalize(f.Endpoint)
 	if err != nil {
 		return nil, err
 	}

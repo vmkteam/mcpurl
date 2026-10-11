@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/vmkteam/mcpurl/pkg/mcp"
 	"github.com/vmkteam/mcpurl/pkg/oauth"
@@ -55,11 +56,9 @@ func (a *App) AccessToken(ctx context.Context) (string, error) {
 	return tp.Token(ctx, "", "")
 }
 
-// Logout drops the stored token for the resolved profile.
+// Logout drops the stored token for the resolved profile, and its dynamic
+// client registration when it has one.
 func (a *App) Logout() error {
-	if a.prof.ClientID == "" {
-		return errors.New("logout needs a clientID (profile or --client-id) to locate the stored token")
-	}
 	a.dropTokens(a.store(), a.prof)
 	return nil
 }
@@ -75,27 +74,23 @@ func (a *App) LogoutAll() error {
 	return nil
 }
 
-// dropTokens deletes the stored token for p. The deletion is unconditional
-// (an unreadable leftover must go too), but nothing is reported when there was
+// dropTokens deletes the stored token for p and its dynamic client
+// registration (oauth.Flow.Forget). Nothing is reported when there was
 // nothing stored — "dropped tokens" for an empty store reads as a lie.
 func (a *App) dropTokens(store oauth.Store, p Profile) {
-	if p.URL == "" || p.ClientID == "" {
+	if p.URL == "" {
 		return
 	}
-	key, err := oauth.KeyFor(p.URL, p.ClientID)
+	token, registration, err := a.flowFor(p, store).Forget()
 	if err != nil {
-		return
-	}
-	// Load first only to decide whether to report: it costs one os.ReadFile
-	// for the "nothing stored" case (both backends answer ErrNotFound before
-	// touching the keyring), and Delete must stay a no-op either way.
-	_, loadErr := store.Load(key)
-	if err := store.Delete(key); err != nil {
 		a.warnf("logout %s: %v", p.Name, err)
 		return
 	}
-	if !errors.Is(loadErr, oauth.ErrNotFound) {
+	if token {
 		fmt.Fprintf(a.msg, "dropped tokens for %s\n", p.URL)
+	}
+	if registration {
+		fmt.Fprintf(a.msg, "dropped client registration for %s\n", p.URL)
 	}
 }
 
@@ -118,6 +113,8 @@ func (a *App) Show(w io.Writer, name string) error {
 	fmt.Fprintf(w, "profile:      @%s\nurl:          %s\n", p.Name, p.URL)
 	if p.ClientID != "" {
 		fmt.Fprintf(w, "clientID:     %s\n", p.ClientID)
+	} else if reg, err := a.flowFor(p, nil).Registration(); err == nil && reg != nil {
+		fmt.Fprintf(w, "clientID:     %s (registered dynamically %s)\n", reg.ClientID, reg.RegisteredAt.Format(time.DateOnly))
 	}
 	if p.Issuer != "" {
 		fmt.Fprintf(w, "issuer:       %s\n", p.Issuer)

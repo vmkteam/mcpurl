@@ -182,14 +182,18 @@ func (a *App) tokenProvider() mcp.TokenProvider {
 // store is the token backend for this run (--no-keychain forces files).
 func (a *App) store() oauth.Store { return oauth.NewStore(a.opts.NoKeychain) }
 
-func (a *App) flow() *oauth.Flow {
+func (a *App) flow() *oauth.Flow { return a.flowFor(a.prof, a.store()) }
+
+// flowFor builds the token flow of any profile — logout --all and show walk
+// profiles other than the resolved one.
+func (a *App) flowFor(p Profile, store oauth.Store) *oauth.Flow {
 	return &oauth.Flow{
-		Endpoint:     a.prof.URL,
-		ClientID:     a.prof.ClientID,
-		Scopes:       a.prof.Scopes,
-		Issuer:       a.prof.Issuer,
-		CallbackPort: a.prof.CallbackPort,
-		Store:        a.store(),
+		Endpoint:     p.URL,
+		ClientID:     p.ClientID,
+		Scopes:       p.Scopes,
+		Issuer:       p.Issuer,
+		CallbackPort: p.CallbackPort,
+		Store:        store,
 		HTTP:         a.httpc,
 		Logf:         a.logf,
 		Warnf:        a.warnf,

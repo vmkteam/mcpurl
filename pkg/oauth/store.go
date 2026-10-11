@@ -37,7 +37,8 @@ func (t *Token) Fresh(skew time.Duration) bool {
 	return t.Expiry.IsZero() || time.Until(t.Expiry) > skew
 }
 
-// ErrNotFound is returned by Load when no token is stored under the key.
+// ErrNotFound is returned by Load when nothing is stored under the key (a
+// token, or a client registration for ClientStore).
 var ErrNotFound = errors.New("no stored token")
 
 // Store persists tokens under an opaque key.
@@ -111,6 +112,7 @@ func BaseDir() string {
 func TokensDir() string { return filepath.Join(BaseDir(), "tokens") }
 func LockDir() string   { return filepath.Join(BaseDir(), "locks") }
 
-// WipeFiles removes every file-backend token (`mcpurl logout --all`
-// leftovers from bare-URL runs; keychain entries are deleted per key).
-func WipeFiles() error { return os.RemoveAll(TokensDir()) }
+// WipeFiles removes every file-backend token and every client registration
+// (`mcpurl logout --all` leftovers from bare-URL runs; keychain entries are
+// deleted per key).
+func WipeFiles() error { return errors.Join(os.RemoveAll(TokensDir()), os.RemoveAll(ClientsDir())) }
