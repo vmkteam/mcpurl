@@ -10,6 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/vmkteam/mcpurl/pkg/oauth"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -76,6 +79,41 @@ func TestNewWithoutTarget(t *testing.T) {
 	assert.NoError(t, a.Show(io.Discard, "acme"), "Show without target resolution") //nolint:testifylint // value check
 	// claude-config must not enforce the scheme check — it only renders.
 	assert.NoError(t, a.ClaudeConfig(io.Discard, "@acme", "")) //nolint:testifylint // value check
+}
+
+// A profile without a clientID uses dynamic registration: show names the
+// registered client, logout drops it together with the token — and no longer
+// demands a clientID to find them.
+func TestDynamicClientShowAndLogout(t *testing.T) {
+	const endpoint = "https://mcp.dyn.example/mcp"
+	t.Setenv("HOME", t.TempDir())
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte("[profiles.dyn]\nurl = \""+endpoint+"\"\n"), 0o600))
+	t.Setenv("MCPURL_CONFIG", path)
+
+	clients := &oauth.ClientStore{Dir: oauth.ClientsDir()}
+	clientKey := oauth.Key(endpoint, "http://127.0.0.1:18075/callback")
+	require.NoError(t, clients.Save(clientKey, &oauth.Registration{ClientID: "dyn-7", Issuer: "https://mcp.dyn.example",
+		RegisteredAt: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}))
+	tokens := &oauth.FileStore{Dir: oauth.TokensDir()}
+	require.NoError(t, tokens.Save(oauth.Key(endpoint, "dyn-7"), &oauth.Token{AccessToken: "dyn-access"}))
+
+	a, err := New(Options{}, io.Discard)
+	require.NoError(t, err)
+	var shown bytes.Buffer
+	require.NoError(t, a.Show(&shown, "dyn"))
+	assert.Contains(t, shown.String(), "clientID:     dyn-7 (registered dynamically 2026-10-05)")
+
+	var msg bytes.Buffer
+	a, err = New(Options{Target: "@dyn", NoKeychain: true}, &msg)
+	require.NoError(t, err)
+	require.NoError(t, a.Logout())
+	assert.Contains(t, msg.String(), "dropped tokens for "+endpoint)
+	assert.Contains(t, msg.String(), "dropped client registration for "+endpoint)
+	_, err = clients.Load(clientKey)
+	require.ErrorIs(t, err, oauth.ErrNotFound)
+	_, err = tokens.Load(oauth.Key(endpoint, "dyn-7"))
+	require.ErrorIs(t, err, oauth.ErrNotFound)
 }
 
 // A server that refuses the credential ends the run on exit code 3, with its

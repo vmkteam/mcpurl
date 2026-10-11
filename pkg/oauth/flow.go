@@ -22,12 +22,13 @@ const expirySkew = 60 * time.Second // proactive refresh window (04-oauth.md)
 // flock-single-flight refresh with rotation, deterministic fallthrough to
 // exactly one interactive login. This is the part mcp-remote got wrong.
 type Flow struct {
-	Endpoint     string // MCP endpoint (canonicalized internally)
-	ClientID     string
+	Endpoint     string   // MCP endpoint (canonicalized internally)
+	ClientID     string   // empty = dynamic client registration (register.go)
 	Scopes       []string // override; empty = discovery-driven
 	Issuer       string   // override; skips RFC 9728
 	CallbackPort int
 	Store        Store
+	Clients      *ClientStore // dynamic registrations; nil = ClientsDir()
 	LockDir      string       // default: LockDir()
 	HTTP         *http.Client // nil = http.DefaultClient
 	Logf         func(format string, args ...any)
@@ -39,6 +40,7 @@ type Flow struct {
 
 	mu     sync.Mutex // in-process single-flight (flock handles cross-process)
 	cached *Token
+	reg    *Registration // dynamic registration in use; nil with a configured ClientID
 	// Tokens issued by our own refresh / login in this process: if the server
 	// rejects even those, escalate (refresh → login → give up), never loop.
 	lastRefreshed string
@@ -47,28 +49,28 @@ type Flow struct {
 	loginFn func(ctx context.Context, d *discovery, scopes []string) (*Token, error)
 }
 
-// KeyFor derives the token-store key for an endpoint/clientID pair — the
-// single place this recipe lives (Flow and `mcpurl logout` both use it).
-func KeyFor(endpoint, clientID string) (string, error) {
-	canonical, err := Canonicalize(endpoint)
-	if err != nil {
-		return "", err
-	}
-	return Key(canonical, clientID), nil
-}
-
-// resourceKey is the shared prologue of every Flow entry point: client_id
-// guard, canonical endpoint URL, token-store key. Recomputing it per call is
-// microseconds — not worth caching state for.
+// resourceKey is the shared prologue of every Flow entry point: canonical
+// endpoint URL, client_id, token-store key. Without a configured client_id
+// it picks up a dynamic registration stored by an earlier run (one file read
+// per process); with none it answers errNoClient — ensureClient registers.
+// A registration that fails to load still yields canonical: Forget drops it.
+// Caller holds f.mu.
 func (f *Flow) resourceKey() (canonical, key string, err error) {
-	if f.ClientID == "" {
-		return "", "", errors.New("no client_id: set clientID in the profile (DCR not supported in v1)")
-	}
 	canonical, err = Canonicalize(f.Endpoint)
 	if err != nil {
 		return "", "", err
 	}
-	return canonical, Key(canonical, f.ClientID), nil
+	if f.ClientID == "" && f.reg == nil {
+		reg, err := f.clients().Load(f.clientKey(canonical))
+		switch {
+		case errors.Is(err, ErrNotFound):
+			return canonical, "", errNoClient
+		case err != nil:
+			return canonical, "", err
+		}
+		f.reg = reg
+	}
+	return canonical, Key(canonical, f.clientID()), nil
 }
 
 func (f *Flow) lockDir() string {
@@ -110,13 +112,24 @@ func (f *Flow) printf(format string, args ...any) {
 
 // Token implements streamable.TokenProvider (see its contract).
 func (f *Flow) Token(ctx context.Context, rejected, challenge string) (string, error) {
-	canonical, key, err := f.resourceKey()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	token, err := f.token(ctx, rejected, challenge)
+	if errors.Is(err, errClientGone) {
+		// The dynamic registration was dropped: this round registers anew, and
+		// with no token stored for the new client it ends in one login.
+		token, err = f.token(ctx, rejected, challenge)
+	}
+	return token, err
+}
+
+// token is one round of Token, under f.mu.
+func (f *Flow) token(ctx context.Context, rejected, challenge string) (string, error) {
+	canonical, key, err := f.ensureClient(ctx, challenge)
 	if err != nil {
 		return "", err
 	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
 
 	// Fast path: nothing was rejected and we hold a fresh token. The
 	// in-memory copy spares a store read per message (the keychain backend
@@ -170,6 +183,9 @@ func (f *Flow) obtain(ctx context.Context, key, canonical, rejected, challenge s
 	if err != nil {
 		return "", err
 	}
+	if f.foreignClient(d) {
+		return "", f.dropClient(ctx, canonical, key, "registered at "+f.reg.Issuer+", not at "+d.AS.Issuer)
+	}
 
 	// Refresh — unless the rejected token came from our own refresh (then
 	// refreshing again is pointless, escalate to login).
@@ -189,6 +205,10 @@ func (f *Flow) obtain(ctx context.Context, key, canonical, rejected, challenge s
 			if derr := f.Store.Delete(key); derr != nil {
 				f.debugf("deleting stale token: %v", derr)
 			}
+		case errors.Is(rerr, errInvalidClient) && f.reg != nil:
+			// The server no longer knows the dynamic registration (a reset
+			// base, an expired client): a static client_id has no such cure.
+			return "", f.dropClient(ctx, canonical, key, d.AS.Issuer+" answers invalid_client")
 		default:
 			return "", fmt.Errorf("token refresh: %w", rerr)
 		}
@@ -236,13 +256,13 @@ func (f *Flow) loginAndSave(ctx context.Context, key string, d *discovery, chall
 	if err != nil {
 		return nil, err
 	}
-	t.Issuer, t.ClientID = d.AS.Issuer, f.ClientID
+	t.Issuer, t.ClientID = d.AS.Issuer, f.clientID()
 	// No refresh token means this login repeats on every restart once the
 	// access token expires. Say so now: the alternative is the user meeting it
 	// as a browser popup days later, with nothing to point at.
 	if t.RefreshToken == "" {
 		f.warnf("%s issued no refresh_token (granted scope: %s) — a new browser login will be needed once this one expires; add %s to the profile scopes, and enable it for client %s",
-			d.AS.Issuer, strings.Join(t.Scopes, " "), scopeOffline, f.ClientID)
+			d.AS.Issuer, strings.Join(t.Scopes, " "), scopeOffline, f.clientID())
 	}
 	if err := f.Store.Save(key, t); err != nil {
 		return nil, fmt.Errorf("persisting token after login: %w", err)
@@ -254,7 +274,10 @@ func (f *Flow) loginAndSave(ctx context.Context, key string, d *discovery, chall
 
 const grantRefreshToken = "refresh_token"
 
-var errInvalidGrant = errors.New("invalid_grant")
+var (
+	errInvalidGrant  = errors.New("invalid_grant")
+	errInvalidClient = errors.New("invalid_client")
+)
 
 // refresh POSTs the refresh_token grant by hand: oauth2.TokenSource cannot
 // carry the RFC 8707 resource parameter, and we need rotated refresh tokens
@@ -263,7 +286,7 @@ func (f *Flow) refresh(ctx context.Context, d *discovery, canonical string, stor
 	form := url.Values{
 		"grant_type":      {grantRefreshToken},
 		grantRefreshToken: {stored.RefreshToken},
-		"client_id":       {f.ClientID},
+		"client_id":       {f.clientID()},
 		paramResource:     {canonical},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.AS.TokenEndpoint, strings.NewReader(form.Encode()))
@@ -286,8 +309,11 @@ func (f *Flow) refresh(ctx context.Context, d *discovery, canonical string, stor
 			Error string `json:"error"`
 		}
 		_ = json.Unmarshal(body, &oe)
-		if oe.Error == "invalid_grant" {
+		switch oe.Error {
+		case errInvalidGrant.Error():
 			return nil, errInvalidGrant
+		case errInvalidClient.Error():
+			return nil, fmt.Errorf("token endpoint HTTP %d (%w)", resp.StatusCode, errInvalidClient)
 		}
 		return nil, fmt.Errorf("token endpoint HTTP %d (%s)", resp.StatusCode, oe.Error)
 	}
@@ -309,7 +335,7 @@ func (f *Flow) refresh(ctx context.Context, d *discovery, canonical string, stor
 		AccessToken:  tr.AccessToken,
 		RefreshToken: stored.RefreshToken, // keep unless rotated
 		Issuer:       d.AS.Issuer,
-		ClientID:     f.ClientID,
+		ClientID:     f.clientID(),
 		Scopes:       grantedScopes(tr.Scope, stored.Scopes),
 	}
 	if tr.RefreshToken != "" {
@@ -337,7 +363,7 @@ func grantedScopes(respScope string, requested []string) []string {
 // Login runs the interactive browser flow unconditionally (CLI `mcpurl
 // login`), persisting the result.
 func (f *Flow) Login(ctx context.Context) (*Token, error) {
-	canonical, key, err := f.resourceKey()
+	canonical, err := Canonicalize(f.Endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -349,9 +375,20 @@ func (f *Flow) Login(ctx context.Context) (*Token, error) {
 		return nil, err
 	}
 
-	var out *Token
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	_, key, err := f.ensureClient(ctx, challenge)
+	if err == nil && f.foreignClient(d) {
+		err = f.dropClient(ctx, canonical, key, "registered at "+f.reg.Issuer+", not at "+d.AS.Issuer)
+		if errors.Is(err, errClientGone) {
+			_, key, err = f.ensureClient(ctx, challenge)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var out *Token
 	lockErr := WithLock(ctx, f.lockDir(), key, func() error {
 		t, err := f.loginAndSave(ctx, key, d, challenge)
 		if err != nil {

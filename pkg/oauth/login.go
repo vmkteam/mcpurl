@@ -23,21 +23,18 @@ const DefaultCallbackPort = 18075
 // while the bridge is live: browser pops, the pending MCP request waits until
 // the flow completes.
 func (f *Flow) browserLogin(ctx context.Context, d *discovery, scopes []string) (*Token, error) {
-	canonical, _, err := f.resourceKey()
+	canonical, err := Canonicalize(f.Endpoint)
 	if err != nil {
 		return nil, err
 	}
-	port := f.CallbackPort
-	if port == 0 {
-		port = DefaultCallbackPort
-	}
+	port := f.callbackPort()
 	cfg := &oauth2.Config{
-		ClientID: f.ClientID,
+		ClientID: f.clientID(),
 		Endpoint: oauth2.Endpoint{
 			AuthURL:  d.AS.AuthorizationEndpoint,
 			TokenURL: d.AS.TokenEndpoint,
 		},
-		RedirectURL: fmt.Sprintf("http://127.0.0.1:%d/callback", port),
+		RedirectURL: f.redirectURI(),
 		Scopes:      scopes,
 	}
 
@@ -99,7 +96,7 @@ func (f *Flow) browserLogin(ctx context.Context, d *discovery, scopes []string) 
 	select {
 	case res = <-resCh:
 	case <-time.After(loginTimeout):
-		return nil, errors.New("login timed out after 5 minutes")
+		return nil, errors.New("login timed out after 5 minutes" + f.unknownClientHint())
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -118,6 +115,29 @@ func (f *Flow) browserLogin(ctx context.Context, d *discovery, scopes []string) 
 		Expiry:       tok.Expiry,
 		Scopes:       grantedScopes(respScope(tok), scopes),
 	}, nil
+}
+
+func (f *Flow) callbackPort() int {
+	if f.CallbackPort != 0 {
+		return f.CallbackPort
+	}
+	return DefaultCallbackPort
+}
+
+// redirectURI is the loopback callback browserLogin listens on — and, for a
+// dynamic client, part of what was registered.
+func (f *Flow) redirectURI() string {
+	return fmt.Sprintf("http://127.0.0.1:%d/callback", f.callbackPort())
+}
+
+// unknownClientHint names the way out for a dynamic client: a server that has
+// forgotten the registration fails its authorization page in the browser,
+// where mcpurl cannot see it (RFC 6749 §4.1.2.1 forbids the redirect).
+func (f *Flow) unknownClientHint() string {
+	if f.reg == nil {
+		return ""
+	}
+	return fmt.Sprintf(" — if the browser reported an unknown client, `mcpurl logout` drops registration %s and the next login registers anew", f.reg.ClientID)
 }
 
 // respScope digs the token response's `scope` out of the oauth2 extras.

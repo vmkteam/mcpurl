@@ -30,20 +30,36 @@ type fakeAS struct {
 	alwaysInvalid  bool
 	expiresIn      int64
 	grantedScope   string // echoed as the response `scope` when set
+
+	// Dynamic client registration (register_test.go): with dcr the AS
+	// advertises registration_endpoint, and its token endpoint answers
+	// invalid_client to any client_id it has not registered (or forgot).
+	dcr           bool
+	clientSecret  string   // issued by registration when set: a confidential client
+	registerErr   string   // registration answers HTTP 400 with this error when set
+	otherURIs     []string // registration answers these redirect_uris instead of the requested ones
+	registrations atomic.Int32
+	redirectURIs  []string        // of the last registration (guarded by mu)
+	clients       map[string]bool // registered client_ids (guarded by mu)
 }
 
 func newFakeAS(t *testing.T) *fakeAS {
-	f := &fakeAS{currentRefresh: "refresh-0", expiresIn: 1}
+	f := &fakeAS{currentRefresh: "refresh-0", expiresIn: 1, clients: map[string]bool{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{
+		md := map[string]any{
 			"issuer":                           f.srv.URL,
 			"authorization_endpoint":           f.srv.URL + "/auth",
 			"token_endpoint":                   f.srv.URL + "/token",
 			"scopes_supported":                 []string{"openid", "profile", "offline_access"},
 			"code_challenge_methods_supported": []string{"S256"},
-		})
+		}
+		if f.dcr {
+			md["registration_endpoint"] = f.srv.URL + "/register"
+		}
+		json.NewEncoder(w).Encode(md)
 	})
+	mux.HandleFunc("/register", f.register)
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
 		if r.Form.Get("grant_type") != "refresh_token" {
@@ -53,6 +69,11 @@ func newFakeAS(t *testing.T) *fakeAS {
 		f.refreshCalls.Add(1)
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if f.dcr && !f.clients[r.Form.Get("client_id")] {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":"invalid_client"}`))
+			return
+		}
 		if f.alwaysInvalid || r.Form.Get("refresh_token") != f.currentRefresh {
 			f.invalidGrants.Add(1)
 			w.WriteHeader(http.StatusBadRequest)
@@ -87,6 +108,7 @@ func newTestFlow(t *testing.T, as *fakeAS, dir string) *Flow {
 		ClientID: "test-client",
 		Issuer:   as.srv.URL,
 		Store:    &FileStore{Dir: dir + "/tokens"},
+		Clients:  &ClientStore{Dir: dir + "/clients"},
 		LockDir:  dir + "/locks",
 		Logf:     t.Logf,
 		Msg:      writeFn(func(p []byte) (int, error) { t.Logf("%s", p); return len(p), nil }),
@@ -298,12 +320,6 @@ func TestRefreshAdoptsGrantedScopes(t *testing.T) {
 	stored2, err := f2.Store.Load(key2)
 	require.NoError(t, err)
 	assert.Empty(t, stored2.Scopes, "seeded token carried none; the AS said nothing")
-}
-
-func TestNoClientID(t *testing.T) {
-	f := &Flow{Endpoint: "https://x/mcp", Store: &FileStore{Dir: t.TempDir()}}
-	_, err := f.Token(context.Background(), "", "")
-	require.ErrorContains(t, err, "clientID")
 }
 
 // -v output must never contain token material (04-oauth.md redaction AC).

@@ -52,9 +52,14 @@ One command — it persists a profile and writes the Claude Desktop config
 entry (with a `.bak` backup, other servers untouched):
 
 ```bash
-mcpurl install https://mcp.example.com/mcp --client-id mcp-cli --name mysrv
+mcpurl install https://mcp.example.com/mcp --name mysrv
 # restart Claude Desktop; the browser opens for login on first use
 ```
+
+No `--client-id` needed when the server offers dynamic client registration
+(RFC 7591): mcpurl registers itself on first use. Servers without it —
+Keycloak and authentik as usually configured — need a public client
+provisioned in the IdP: add `--client-id mcp-cli`.
 
 Prefer to log in ahead of time:
 
@@ -75,7 +80,7 @@ existing name updates the profile in place.
 ```
 mcpurl [flags] <url | @profile>          run the stdio bridge (default command)
 mcpurl login  <url | @profile>           interactive browser PKCE login
-mcpurl logout <url | @profile | --all>   drop stored tokens
+mcpurl logout <url | @profile | --all>   drop stored tokens and client registration
 mcpurl token  <url | @profile>           print access_token (auto-refresh)
 mcpurl show   [name]                     list profiles / show one (no secrets)
 mcpurl claude-config <url | @profile>    print ready-to-paste client config
@@ -88,7 +93,8 @@ mcpurl version
 
 The bare-URL form works with zero config against any spec-compliant server —
 discovery does the rest. A profile only pins what discovery can't provide
-(client_id, a non-default callback port, scope overrides). The `@` is a
+(client_id where the server has no dynamic registration, a non-default
+callback port, scope overrides). The `@` is a
 readability marker, not a requirement: `@mysrv` and `mysrv` are the same
 target in every command.
 
@@ -100,7 +106,7 @@ secrets live here — tokens are in the keychain/token store:
 ```toml
 [profiles.mysrv]
 url          = "https://mcp.example.com/mcp"
-clientID     = "mcp-cli"
+clientID     = "mcp-cli"                              # omit to register dynamically (RFC 7591)
 callbackPort = 18075
 scopes       = ["openid", "profile", "offline_access"]
 # issuer     = "https://auth.example.com/realms/main"  # optional: skip discovery
@@ -115,9 +121,9 @@ Resolution order for every setting: **flag > profile > discovery > default**.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--client-id ID` | — | OAuth client_id (overrides profile) |
+| `--client-id ID` | dynamic registration | OAuth client_id (overrides profile); omit when the server offers RFC 7591 |
 | `--scopes "a,b"` | discovery | OAuth scopes override |
-| `--callback-port N` | `18075` | Loopback port for `http://127.0.0.1:N/callback`; register it in the IdP |
+| `--callback-port N` | `18075` | Loopback port for `http://127.0.0.1:N/callback`; register it in the IdP for a static client_id |
 | `--issuer URL` | — | Skip RFC 9728 discovery, use this authorization server |
 | `--header K:V` | — | Extra HTTP header, repeatable; `$VAR` expanded |
 | `--bearer-env NAME` | — | Static bearer from env (`MY_<NAME>` checked first); disables OAuth |
@@ -134,7 +140,11 @@ On the first `401` mcpurl discovers the authorization server (RFC 9728
 `WWW-Authenticate`/well-known → RFC 8414 / OIDC metadata), validates the
 issuer and resource identifiers, refuses PKCE-less servers, and runs the
 Authorization Code + PKCE (S256) flow through your browser with the RFC 8707
-`resource` parameter. Tokens are stored encrypted (AES-256-GCM) under
+`resource` parameter. Without a configured client_id it registers itself
+first (RFC 7591 dynamic client registration, when the server advertises a
+`registration_endpoint`): a public client bound to the loopback callback,
+kept in `~/.config/mcpurl/clients/` and reused — re-registered automatically
+when the server rejects it on token refresh. Tokens are stored encrypted (AES-256-GCM) under
 `~/.config/mcpurl/tokens/`, keyed by endpoint + client_id, with the
 encryption key in the macOS keychain / Secret Service; `--no-keychain` (and
 Windows in v1) falls back to plain `0600` files.
@@ -144,8 +154,9 @@ processes: several bridge instances coordinate via a file lock, always
 persisting rotated refresh tokens. If refresh is rejected, mcpurl falls back
 to one interactive login — the pending MCP request just waits.
 
-The IdP client must be **public** with PKCE S256 and have
-`http://127.0.0.1:<callbackPort>/callback` registered as a redirect URI.
+A static client (`clientID`) must be **public** with PKCE S256 and have
+`http://127.0.0.1:<callbackPort>/callback` registered as a redirect URI in
+the IdP; dynamic registration sets up both by itself.
 
 ## Exit codes
 
@@ -163,6 +174,9 @@ The IdP client must be **public** with PKCE S256 and have
 - Add `"-v"` to the client's `args` for a full trace (tokens are redacted).
 - `login` fails with "port busy or not registered"? Check the redirect URI in
   the IdP and that nothing else listens on the callback port.
+- The browser login page reports an unknown or invalid client? The server has
+  forgotten mcpurl's dynamic registration: `mcpurl logout @mysrv` drops it,
+  and the next start registers anew.
 - Manual end-to-end check: `npx @modelcontextprotocol/inspector` with command
   `mcpurl`, args `@mysrv`.
 
