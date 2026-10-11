@@ -117,8 +117,9 @@ func (f *Flow) Token(ctx context.Context, rejected, challenge string) (string, e
 
 	token, err := f.token(ctx, rejected, challenge)
 	if errors.Is(err, errClientGone) {
-		// The dynamic registration was dropped: this round registers anew, and
-		// with no token stored for the new client it ends in one login.
+		// The dynamic registration was dropped, here or by another process:
+		// this round picks up the current one or registers anew, and ends in
+		// at most one login.
 		token, err = f.token(ctx, rejected, challenge)
 	}
 	return token, err
@@ -156,6 +157,11 @@ func (f *Flow) token(ctx context.Context, rejected, challenge string) (string, e
 // obtain runs under both locks: reload → refresh → interactive, always
 // persisting rotated refresh tokens.
 func (f *Flow) obtain(ctx context.Context, key, canonical, rejected, challenge string) (string, error) {
+	if f.clientReplaced(canonical) {
+		f.leaveClient()
+		return "", errClientGone
+	}
+
 	stored, err := f.Store.Load(key)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return "", err

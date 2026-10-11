@@ -230,11 +230,7 @@ func (f *Flow) dropClient(ctx context.Context, canonical, key, why string) error
 	if err := f.Store.Delete(key); err != nil {
 		f.debugf("deleting token of the dropped client: %v", err)
 	}
-	f.reg, f.cached = nil, nil
-	// Tokens the dropped client got say nothing about the new one: kept, they
-	// would read as "the server rejects even fresh tokens" and stop the login
-	// the next round owes.
-	f.lastRefreshed, f.lastLoggedIn = "", ""
+	f.leaveClient()
 	ck := f.clientKey(canonical)
 	err := WithLock(ctx, f.lockDir(), clientLockPrefix+ck, func() error {
 		if reg, lerr := f.clients().Load(ck); lerr == nil && reg.ClientID == gone.ClientID {
@@ -246,6 +242,27 @@ func (f *Flow) dropClient(ctx context.Context, canonical, key, why string) error
 		return err
 	}
 	return errClientGone
+}
+
+// clientReplaced reports that another process has dropped or replaced the
+// dynamic registration this one holds — typically while this one waited for
+// the token lock. Logging in with it would open the browser on a client_id
+// the server no longer knows.
+func (f *Flow) clientReplaced(canonical string) bool {
+	if f.ClientID != "" || f.reg == nil {
+		return false
+	}
+	reg, err := f.clients().Load(f.clientKey(canonical))
+	return err != nil || reg.ClientID != f.reg.ClientID
+}
+
+// leaveClient forgets the dynamic registration in use with everything this
+// process got from it. The tokens it issued say nothing about the next
+// client: kept, they would read as "the server rejects even fresh tokens"
+// and stop the login the next round owes.
+func (f *Flow) leaveClient() {
+	f.reg, f.cached = nil, nil
+	f.lastRefreshed, f.lastLoggedIn = "", ""
 }
 
 // Registration returns the dynamic registration in use for the endpoint; nil
@@ -293,7 +310,7 @@ func (f *Flow) Forget() (token, registration bool, err error) {
 		if err := f.clients().Delete(f.clientKey(canonical)); err != nil {
 			return token, false, err
 		}
-		f.reg, f.cached = nil, nil
+		f.leaveClient()
 		registration = true
 	}
 	return token, registration, nil

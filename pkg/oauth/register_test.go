@@ -18,7 +18,7 @@ import (
 const testRedirectURI = "http://127.0.0.1:18075/callback"
 
 // register is the fake AS side of RFC 7591: public clients only, every
-// registration a new client_id.
+// registration a new client_id — or the canned answer when one is set.
 func (f *fakeAS) register(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		RedirectURIs []string `json:"redirect_uris"`
@@ -26,9 +26,9 @@ func (f *fakeAS) register(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	switch {
-	case f.registerErr != "":
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": f.registerErr, "error_description": "refused by the test"})
+	case f.registerBody != "":
+		w.WriteHeader(f.registerStatus)
+		w.Write([]byte(f.registerBody))
 		return
 	case r.Method != http.MethodPost, json.NewDecoder(r.Body).Decode(&in) != nil, len(in.RedirectURIs) == 0, in.AuthMethod != "none":
 		w.WriteHeader(http.StatusBadRequest)
@@ -40,16 +40,13 @@ func (f *fakeAS) register(w http.ResponseWriter, r *http.Request) {
 	id := fmt.Sprintf("dyn-%d", f.registrations.Add(1))
 	f.clients[id] = true
 	f.redirectURIs = in.RedirectURIs
-	uris := in.RedirectURIs
-	if f.otherURIs != nil {
-		uris = f.otherURIs
-	}
-	resp := map[string]any{"client_id": id, "redirect_uris": uris, "token_endpoint_auth_method": "none"}
-	if f.clientSecret != "" {
-		resp["client_secret"] = f.clientSecret
-	}
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(map[string]any{"client_id": id, "redirect_uris": in.RedirectURIs, "token_endpoint_auth_method": "none"})
+}
+
+// answer makes the fake AS offer registration and reply to it verbatim.
+func answer(status int, body string) func(*fakeAS) {
+	return func(as *fakeAS) { as.dcr, as.registerStatus, as.registerBody = true, status, body }
 }
 
 // forgetClients is the server losing its registrations (a reset base).
@@ -205,6 +202,38 @@ func TestReRegisterAfterOwnLogin(t *testing.T) {
 	assert.EqualValues(t, 2, logins.Load())
 }
 
+// Two bridges share a registration the server forgot. The one that drops it
+// registers anew and logs in; the other, waiting on the same token lock,
+// must follow the new registration — not open a second browser window on a
+// client_id the server no longer knows.
+func TestReRegisterFollowedByOtherProcess(t *testing.T) {
+	as := newFakeAS(t)
+	as.dcr = true
+	dir := t.TempDir()
+	var logins atomic.Int32
+	first, second := newDCRFlow(t, as, dir, &logins), newDCRFlow(t, as, dir, &logins)
+	tok, err := first.Token(context.Background(), "", "")
+	require.NoError(t, err)
+	_, err = second.Token(context.Background(), "", "")
+	require.NoError(t, err, "the second bridge picks up dyn-1 and its token")
+
+	canonical, _ := Canonicalize(first.Endpoint)
+	require.NoError(t, first.Store.Save(Key(canonical, "dyn-1"), &Token{AccessToken: tok, RefreshToken: "refresh-0",
+		Expiry: time.Now().Add(-time.Minute)}))
+	as.forgetClients()
+	const expired = `Bearer error="invalid_token", error_description="token expired"`
+
+	tok1, err := first.Token(context.Background(), tok, expired)
+	require.NoError(t, err)
+	tok2, err := second.Token(context.Background(), tok, expired)
+	require.NoError(t, err)
+	assert.Equal(t, "login-access-2", tok1)
+	assert.Equal(t, tok1, tok2, "the second bridge reuses the first one's login")
+	assert.EqualValues(t, 2, logins.Load())
+	assert.EqualValues(t, 2, as.registrations.Load())
+	assert.Equal(t, "dyn-2", second.clientID())
+}
+
 // invalid_client for a configured client_id is the operator's to fix: no
 // substitute gets registered, the refusal is reported as it came.
 func TestInvalidStaticClient(t *testing.T) {
@@ -269,16 +298,34 @@ func TestLoginRegisters(t *testing.T) {
 	assert.EqualValues(t, 1, logins.Load())
 }
 
+// Every registration answer mcpurl cannot use is refused with its reason,
+// before anything is persisted or a browser opens.
 func TestRegistrationRefusals(t *testing.T) {
+	const jwt = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJhIn0"
 	tests := []struct {
 		name  string
 		setup func(as *fakeAS)
-		want  []string
+		want  []string // in the error
+		hide  string   // never in the error
 	}{
-		{"no registration endpoint", func(*fakeAS) {}, []string{"clientID", "no dynamic client registration"}},
-		{"confidential client", func(as *fakeAS) { as.dcr, as.clientSecret = true, "s3cret" }, []string{"client_secret", "clientID"}},
-		{"server error", func(as *fakeAS) { as.dcr, as.registerErr = true, "invalid_redirect_uri" }, []string{"HTTP 400", "invalid_redirect_uri: refused by the test"}},
-		{"other redirect_uris", func(as *fakeAS) { as.dcr, as.otherURIs = true, []string{"https://evil.example/cb"} }, []string{"https://evil.example/cb", "instead of " + testRedirectURI}},
+		{name: "no registration endpoint", setup: func(*fakeAS) {},
+			want: []string{"clientID", "no dynamic client registration"}},
+		{name: "plain http endpoint", setup: func(as *fakeAS) { as.registrationURL = "http://dcr.example.com/register" },
+			want: []string{"is not https"}},
+		{name: "confidential client", setup: answer(http.StatusCreated, `{"client_id":"c-1","client_secret":"s3cret"}`),
+			want: []string{"client_secret", "clientID"}, hide: "s3cret"},
+		{name: "other redirect_uris", setup: answer(http.StatusCreated, `{"client_id":"c-1","redirect_uris":["https://evil.example/cb"]}`),
+			want: []string{"https://evil.example/cb", "instead of " + testRedirectURI}},
+		{name: "no client_id", setup: answer(http.StatusCreated, `{"redirect_uris":["`+testRedirectURI+`"]}`),
+			want: []string{"no client_id"}},
+		{name: "not JSON", setup: answer(http.StatusCreated, `<html>`),
+			want: []string{"bad response"}},
+		{name: "OAuth error", setup: answer(http.StatusBadRequest, `{"error":"invalid_redirect_uri","error_description":"loopback not allowed"}`),
+			want: []string{"HTTP 400", "invalid_redirect_uri: loopback not allowed"}},
+		{name: "OAuth error quoting a token", setup: answer(http.StatusUnauthorized, `{"error":"invalid_token","error_description":"initial access token `+jwt+` expired"}`),
+			want: []string{"HTTP 401", "invalid_token: initial access token"}, hide: jwt},
+		{name: "error page", setup: answer(http.StatusNotFound, `<html>Not Found</html>`),
+			want: []string{"HTTP 404"}, hide: "<html>"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -293,8 +340,41 @@ func TestRegistrationRefusals(t *testing.T) {
 			for _, w := range tt.want {
 				assert.Contains(t, err.Error(), w)
 			}
+			if tt.hide != "" {
+				assert.NotContains(t, err.Error(), tt.hide)
+			}
 			assert.Nil(t, loadRegistration(t, dir, f.Endpoint), "nothing is persisted")
 			assert.Zero(t, logins.Load(), "no browser without a client")
+		})
+	}
+}
+
+// Lenient where it costs nothing: 200 in place of 201, and an answer that
+// skips the metadata echo RFC 7591 §3.2.1 asks for.
+func TestRegistrationLenientAnswers(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"200 OK", http.StatusOK, `{"client_id":"c-ok","redirect_uris":["` + testRedirectURI + `"]}`},
+		{"no redirect_uris echo", http.StatusCreated, `{"client_id":"c-ok"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			as := newFakeAS(t)
+			answer(tt.status, tt.body)(as)
+			dir := t.TempDir()
+			var logins atomic.Int32
+			f := newDCRFlow(t, as, dir, &logins)
+
+			_, err := f.Token(context.Background(), "", "")
+			require.NoError(t, err)
+			reg := loadRegistration(t, dir, f.Endpoint)
+			require.NotNil(t, reg)
+			assert.Equal(t, "c-ok", reg.ClientID)
+			assert.Equal(t, testRedirectURI, reg.RedirectURI)
+			assert.EqualValues(t, 1, logins.Load())
 		})
 	}
 }
@@ -348,25 +428,29 @@ func TestForget(t *testing.T) {
 // An unreadable registration stops every run with a pointer to logout, and
 // logout drops it: the next run registers anew.
 func TestForgetCorruptRegistration(t *testing.T) {
-	as := newFakeAS(t)
-	as.dcr = true
-	dir := t.TempDir()
-	var logins atomic.Int32
-	f := newDCRFlow(t, as, dir, &logins)
-	canonical, _ := Canonicalize(f.Endpoint)
-	require.NoError(t, os.MkdirAll(dir+"/clients", 0o700))
-	require.NoError(t, os.WriteFile(f.clients().path(Key(canonical, testRedirectURI)), []byte("{"), 0o600))
+	for _, body := range []string{"", "{", "{}", `{"client_id":""}`} {
+		t.Run(fmt.Sprintf("%q", body), func(t *testing.T) {
+			as := newFakeAS(t)
+			as.dcr = true
+			dir := t.TempDir()
+			var logins atomic.Int32
+			f := newDCRFlow(t, as, dir, &logins)
+			canonical, _ := Canonicalize(f.Endpoint)
+			require.NoError(t, os.MkdirAll(dir+"/clients", 0o700))
+			require.NoError(t, os.WriteFile(f.clients().path(Key(canonical, testRedirectURI)), []byte(body), 0o600))
 
-	_, err := f.Token(context.Background(), "", "")
-	require.ErrorContains(t, err, "`mcpurl logout` drops it")
+			_, err := f.Token(context.Background(), "", "")
+			require.ErrorContains(t, err, "`mcpurl logout` drops it")
 
-	token, registration, err := newDCRFlow(t, as, dir, &logins).Forget()
-	require.NoError(t, err)
-	assert.False(t, token, "its token is out of reach without the client_id")
-	assert.True(t, registration)
+			token, registration, err := newDCRFlow(t, as, dir, &logins).Forget()
+			require.NoError(t, err)
+			assert.False(t, token, "its token is out of reach without the client_id")
+			assert.True(t, registration)
 
-	tok, err := newDCRFlow(t, as, dir, &logins).Token(context.Background(), "", "")
-	require.NoError(t, err)
-	assert.Equal(t, "login-access-1", tok)
-	assert.EqualValues(t, 1, as.registrations.Load())
+			tok, err := newDCRFlow(t, as, dir, &logins).Token(context.Background(), "", "")
+			require.NoError(t, err)
+			assert.Equal(t, "login-access-1", tok)
+			assert.EqualValues(t, 1, as.registrations.Load())
+		})
+	}
 }

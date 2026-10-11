@@ -82,38 +82,65 @@ func TestNewWithoutTarget(t *testing.T) {
 }
 
 // A profile without a clientID uses dynamic registration: show names the
-// registered client, logout drops it together with the token — and no longer
-// demands a clientID to find them.
-func TestDynamicClientShowAndLogout(t *testing.T) {
+// registered client, and every command that drops the profile's token —
+// logout (no clientID needed any more), logout --all, uninstall — drops the
+// registration with it.
+func TestDynamicClient(t *testing.T) {
 	const endpoint = "https://mcp.dyn.example/mcp"
-	t.Setenv("HOME", t.TempDir())
-	path := filepath.Join(t.TempDir(), "config.toml")
-	require.NoError(t, os.WriteFile(path, []byte("[profiles.dyn]\nurl = \""+endpoint+"\"\n"), 0o600))
-	t.Setenv("MCPURL_CONFIG", path)
-
-	clients := &oauth.ClientStore{Dir: oauth.ClientsDir()}
 	clientKey := oauth.Key(endpoint, "http://127.0.0.1:18075/callback")
-	require.NoError(t, clients.Save(clientKey, &oauth.Registration{ClientID: "dyn-7", Issuer: "https://mcp.dyn.example",
-		RegisteredAt: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}))
-	tokens := &oauth.FileStore{Dir: oauth.TokensDir()}
-	require.NoError(t, tokens.Save(oauth.Key(endpoint, "dyn-7"), &oauth.Token{AccessToken: "dyn-access"}))
+	tokenKey := oauth.Key(endpoint, "dyn-7")
 
-	a, err := New(Options{}, io.Discard)
-	require.NoError(t, err)
-	var shown bytes.Buffer
-	require.NoError(t, a.Show(&shown, "dyn"))
-	assert.Contains(t, shown.String(), "clientID:     dyn-7 (registered dynamically 2026-10-05)")
+	// setup gives each case its own config and stores: a registration and
+	// the token issued to it.
+	setup := func(t *testing.T) (clients *oauth.ClientStore, tokens *oauth.FileStore) {
+		t.Helper()
+		t.Setenv("HOME", t.TempDir())
+		path := filepath.Join(t.TempDir(), "config.toml")
+		require.NoError(t, os.WriteFile(path, []byte("[profiles.dyn]\nurl = \""+endpoint+"\"\n"), 0o600))
+		t.Setenv("MCPURL_CONFIG", path)
 
-	var msg bytes.Buffer
-	a, err = New(Options{Target: "@dyn", NoKeychain: true}, &msg)
-	require.NoError(t, err)
-	require.NoError(t, a.Logout())
-	assert.Contains(t, msg.String(), "dropped tokens for "+endpoint)
-	assert.Contains(t, msg.String(), "dropped client registration for "+endpoint)
-	_, err = clients.Load(clientKey)
-	require.ErrorIs(t, err, oauth.ErrNotFound)
-	_, err = tokens.Load(oauth.Key(endpoint, "dyn-7"))
-	require.ErrorIs(t, err, oauth.ErrNotFound)
+		clients = &oauth.ClientStore{Dir: oauth.ClientsDir()}
+		require.NoError(t, clients.Save(clientKey, &oauth.Registration{ClientID: "dyn-7", Issuer: "https://mcp.dyn.example",
+			RegisteredAt: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}))
+		tokens = &oauth.FileStore{Dir: oauth.TokensDir()}
+		require.NoError(t, tokens.Save(tokenKey, &oauth.Token{AccessToken: "dyn-access"}))
+		return clients, tokens
+	}
+
+	t.Run("show names the registered client", func(t *testing.T) {
+		setup(t)
+		a, err := New(Options{}, io.Discard)
+		require.NoError(t, err)
+		var shown bytes.Buffer
+		require.NoError(t, a.Show(&shown, "dyn"))
+		assert.Contains(t, shown.String(), "clientID:     dyn-7 (registered dynamically 2026-10-05)")
+	})
+
+	tests := []struct {
+		name   string
+		target string
+		run    func(a *App) error
+	}{
+		{"logout", "@dyn", func(a *App) error { return a.Logout() }},
+		{"logout --all", "", func(a *App) error { return a.LogoutAll() }},
+		{"uninstall", "", func(a *App) error { return a.Uninstall("claude-desktop", "dyn") }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name+" drops the registration", func(t *testing.T) {
+			clients, tokens := setup(t)
+			var msg bytes.Buffer
+			a, err := New(Options{Target: tt.target, NoKeychain: true}, &msg)
+			require.NoError(t, err)
+
+			require.NoError(t, tt.run(a))
+			_, err = clients.Load(clientKey)
+			require.ErrorIs(t, err, oauth.ErrNotFound)
+			_, err = tokens.Load(tokenKey)
+			require.ErrorIs(t, err, oauth.ErrNotFound)
+			assert.Contains(t, msg.String(), "dropped tokens for "+endpoint)
+			assert.Contains(t, msg.String(), "dropped client registration for "+endpoint)
+		})
+	}
 }
 
 // A server that refuses the credential ends the run on exit code 3, with its

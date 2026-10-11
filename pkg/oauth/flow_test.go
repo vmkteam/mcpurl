@@ -34,13 +34,13 @@ type fakeAS struct {
 	// Dynamic client registration (register_test.go): with dcr the AS
 	// advertises registration_endpoint, and its token endpoint answers
 	// invalid_client to any client_id it has not registered (or forgot).
-	dcr           bool
-	clientSecret  string   // issued by registration when set: a confidential client
-	registerErr   string   // registration answers HTTP 400 with this error when set
-	otherURIs     []string // registration answers these redirect_uris instead of the requested ones
-	registrations atomic.Int32
-	redirectURIs  []string        // of the last registration (guarded by mu)
-	clients       map[string]bool // registered client_ids (guarded by mu)
+	dcr             bool
+	registrationURL string // advertised instead of its own /register when set
+	registerStatus  int    // with registerBody: the registration answer, verbatim
+	registerBody    string
+	registrations   atomic.Int32
+	redirectURIs    []string        // of the last registration (guarded by mu)
+	clients         map[string]bool // registered client_ids (guarded by mu)
 }
 
 func newFakeAS(t *testing.T) *fakeAS {
@@ -54,7 +54,10 @@ func newFakeAS(t *testing.T) *fakeAS {
 			"scopes_supported":                 []string{"openid", "profile", "offline_access"},
 			"code_challenge_methods_supported": []string{"S256"},
 		}
-		if f.dcr {
+		switch {
+		case f.registrationURL != "":
+			md["registration_endpoint"] = f.registrationURL
+		case f.dcr:
 			md["registration_endpoint"] = f.srv.URL + "/register"
 		}
 		json.NewEncoder(w).Encode(md)
