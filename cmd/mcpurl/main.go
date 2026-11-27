@@ -1,5 +1,7 @@
-// mcpurl bridges stdio MCP clients (Claude Desktop, Cursor, Windsurf) to
-// remote Streamable HTTP MCP servers, with OAuth 2.1 PKCE handled locally.
+// mcpurl bridges stdio MCP clients (Claude Desktop, Cursor, Windsurf, Claude
+// Code) to remote Streamable HTTP MCP servers, with OAuth 2.1 handled
+// locally: browser PKCE for people, the client_credentials grant for service
+// accounts on headless machines.
 //
 // This package is the CLI shell only: flags, dispatch, exit codes, signals.
 // The application logic lives in pkg/app.
@@ -70,14 +72,15 @@ func run(args []string) int {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `mcpurl — stdio ↔ Streamable HTTP MCP bridge with local OAuth 2.1 (PKCE).
+	fmt.Fprintln(os.Stderr, `mcpurl — stdio ↔ Streamable HTTP MCP bridge with local OAuth 2.1: browser
+PKCE login, or client_credentials for service accounts.
 
 Usage:
   mcpurl [flags] <url | @profile>          run the stdio bridge (default)
   mcpurl login  [flags] <url | @profile>   interactive browser PKCE login
                                            (client_credentials: mint a token)
   mcpurl logout <url | @profile | --all>   drop stored tokens and client registration
-  mcpurl token  [flags] <url | @profile>   print access_token (auto-refresh)
+  mcpurl token  [flags] <url | @profile>   print access_token (refreshed or re-minted)
   mcpurl show   [name]                     list profiles / show one (no secrets)
   mcpurl claude-config <url | @profile>    print MCP client config snippets
   mcpurl install   [flags] <url | @profile>
@@ -90,7 +93,12 @@ Usage:
 
 Profiles: ~/.config/mcpurl/config.toml (MCPURL_CONFIG overrides). The "@" is
 optional everywhere — "@mysrv" and "mysrv" are the same target. Run
-'mcpurl <cmd> -h' for flags.`)
+'mcpurl <cmd> -h' for flags.
+
+Service accounts (no browser): grant = "client_credentials" in the profile,
+with clientID, issuer, and username + passwordFile|passwordEnv (authentik) or
+clientSecretFile|clientSecretEnv — or the matching --grant / --username /
+--password-file / ... flags.`)
 }
 
 func fail(code int, err error) int {

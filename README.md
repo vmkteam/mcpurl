@@ -5,13 +5,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A single-binary bridge between **stdio MCP clients** (Claude Desktop, Cursor,
-Windsurf) and **remote MCP servers over Streamable HTTP**, with OAuth 2.1
-(PKCE) handled locally. Zero runtime dependencies — no Node, no npx.
+Windsurf, Claude Code) and **remote MCP servers over Streamable HTTP**, with
+OAuth 2.1 handled locally: browser PKCE for people, the `client_credentials`
+grant for service accounts on headless machines. Zero runtime dependencies —
+no Node, no npx.
 
 ```
 Claude Desktop ── stdio ── mcpurl ── HTTPS ── https://mcp.example.com/mcp
                              │
-                             └─ browser PKCE ── Keycloak / authentik / any OAuth 2.1 AS
+                             └─ browser PKCE / client_credentials ── Keycloak / authentik / any OAuth 2.1 AS
 ```
 
 ## Why
@@ -85,7 +87,7 @@ mcpurl [flags] <url | @profile>          run the stdio bridge (default command)
 mcpurl login  <url | @profile>           interactive browser PKCE login
                                          (service account: mint a token)
 mcpurl logout <url | @profile | --all>   drop stored tokens and client registration
-mcpurl token  <url | @profile>           print access_token (auto-refresh)
+mcpurl token  <url | @profile>           print access_token (refreshed or re-minted)
 mcpurl show   [name]                     list profiles / show one (no secrets)
 mcpurl claude-config <url | @profile>    print ready-to-paste client config
 mcpurl install   <url | @profile> [--client claude-desktop|cursor|windsurf]
@@ -224,6 +226,14 @@ A static client (`clientID`) must be **public** with PKCE S256 and have
 `http://127.0.0.1:<callbackPort>/callback` registered as a redirect URI in
 the IdP; dynamic registration sets up both by itself.
 
+A service account never sees a browser: with `grant = "client_credentials"`
+mcpurl mints the access token at the token endpoint of the pinned `issuer`,
+stores it the same way and mints the next one before it expires — see
+[Headless / service accounts](#headless--service-accounts). Token-endpoint
+requests never follow redirects: on 307/308 the form — a password, a refresh
+token, an authorization code — would be re-sent to wherever `Location`
+points.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -243,6 +253,15 @@ the IdP; dynamic registration sets up both by itself.
 - The browser login page reports an unknown or invalid client? The server has
   forgotten mcpurl's dynamic registration: `mcpurl logout @mysrv` drops it,
   and the next start registers anew.
+- A service account gets `invalid_grant`? authentik gives that same answer
+  for a provider without the `client_credentials` grant type, an account not
+  bound to the application, and a wrong or expired app password — the error
+  lists all three. The refusal is remembered for 30 s (or until the secret
+  changes), so fix the IdP side and wait, or rotate the secret.
+- `… names authorization server X, but the profile pins issuer Y`? The
+  server's metadata points at another IdP than the profile's `issuer`: fix
+  whichever is wrong — the service account's secret goes to the configured
+  issuer only.
 - Manual end-to-end check: `npx @modelcontextprotocol/inspector` with command
   `mcpurl`, args `@mysrv`.
 
