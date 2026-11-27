@@ -360,7 +360,7 @@ func (f *Flow) refresh(ctx context.Context, d *discovery, canonical string, stor
 	tr, err := f.postToken(ctx, d.AS.TokenEndpoint, url.Values{
 		"grant_type":      {grantRefreshToken},
 		grantRefreshToken: {stored.RefreshToken},
-		"client_id":       {f.clientID()},
+		paramClientID:     {f.clientID()},
 		paramResource:     {canonical},
 	}, "")
 	if err != nil {

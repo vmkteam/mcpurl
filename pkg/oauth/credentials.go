@@ -137,7 +137,7 @@ func (f *Flow) mint(ctx context.Context, d *discovery, canonical, challenge, sec
 	clientSecret := secret // the standard shape: HTTP Basic, no credential in the form
 	if f.Credentials.Username != "" {
 		clientSecret = ""
-		form.Set("client_id", f.clientID())
+		form.Set(paramClientID, f.clientID())
 		form.Set("username", f.Credentials.Username)
 		form.Set("password", secret)
 	}

@@ -29,6 +29,7 @@ const (
 	scopeProfile  = "profile"        // OIDC default scope
 	scopeOffline  = "offline_access" // OIDC Core §11: no refresh token without it
 	paramResource = "resource"       // RFC 8707 resource indicator
+	paramClientID = "client_id"      // token-request form field (RFC 6749 §2.3.1)
 	paramScope    = "scope"          // challenge parameter and token-response field
 
 	// Well-known document names (RFC 8414 / RFC 9728 / OIDC Discovery).
