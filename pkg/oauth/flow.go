@@ -235,7 +235,7 @@ func (f *Flow) obtain(ctx context.Context, key, canonical, rejected, challenge s
 
 	// Refresh — unless the rejected token came from our own refresh (then
 	// refreshing again is pointless, escalate to login).
-	if stored != nil && stored.RefreshToken != "" && (rejected == "" || rejected != f.lastRefreshed) {
+	if (rejected == "" || rejected != f.lastRefreshed) && f.refreshable(stored, d) {
 		t, rerr := f.refresh(ctx, d, canonical, stored)
 		switch {
 		case rerr == nil:
@@ -270,6 +270,25 @@ func (f *Flow) obtain(ctx context.Context, key, canonical, rejected, challenge s
 		return "", err
 	}
 	return t.AccessToken, nil
+}
+
+// refreshable reports whether stored can be refreshed at the discovered
+// authorization server. A refresh token goes back only to the server that
+// issued it: discovery follows the MCP server's own metadata, and a server
+// that starts naming another authorization server — compromised, or moved to
+// a new IdP — must not collect it. A public client's refresh token needs no
+// secret to be spent. The next step is a login there instead, in plain sight.
+// Tokens stored before Issuer was recorded carry none and pass.
+func (f *Flow) refreshable(stored *Token, d *discovery) bool {
+	if stored == nil || stored.RefreshToken == "" {
+		return false
+	}
+	if stored.Issuer != "" && !sameIssuer(stored.Issuer, d.AS.Issuer) {
+		f.warnf("the stored refresh token was issued by %s, but discovery now names %s: not sending it there — a new login follows",
+			stored.Issuer, d.AS.Issuer)
+		return false
+	}
+	return true
 }
 
 // selfIssued reports that the rejected token is one this process obtained —

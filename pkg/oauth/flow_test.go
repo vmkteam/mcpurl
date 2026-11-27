@@ -388,6 +388,43 @@ func TestRefreshAdoptsGrantedScopes(t *testing.T) {
 	assert.Empty(t, stored2.Scopes, "seeded token carried none; the AS said nothing")
 }
 
+// A refresh token goes back only to the server that issued it. When the
+// MCP server's metadata starts naming another authorization server, the
+// stored refresh token stays home and a login follows instead.
+func TestRefreshTokenStaysWithItsIssuer(t *testing.T) {
+	as := newFakeAS(t)
+	f := newTestFlow(t, as, t.TempDir())
+	var warnings []string
+	f.Warnf = func(format string, args ...any) { warnings = append(warnings, fmt.Sprintf(format, args...)) }
+	require.NoError(t, f.Store.Save(flowKey(f), &Token{
+		AccessToken: "access-0", RefreshToken: "refresh-0",
+		Expiry: time.Now().Add(-time.Minute), Issuer: "https://old-idp.example",
+	}))
+	var logins atomic.Int32
+	f.loginFn = func(context.Context, *discovery, []string) (*Token, error) {
+		logins.Add(1)
+		return &Token{AccessToken: "login-access", RefreshToken: "login-refresh", Expiry: time.Now().Add(time.Hour)}, nil
+	}
+
+	tok, err := f.Token(context.Background(), "", "")
+	require.NoError(t, err)
+	assert.Equal(t, "login-access", tok)
+	assert.Zero(t, as.refreshCalls.Load(), "the refresh token must not reach another issuer")
+	assert.EqualValues(t, 1, logins.Load())
+	require.Len(t, warnings, 1)
+	assert.Contains(t, warnings[0], "issued by https://old-idp.example")
+
+	// The same issuer, trailing slash aside, refreshes as usual.
+	f2 := newTestFlow(t, newFakeAS(t), t.TempDir())
+	require.NoError(t, f2.Store.Save(flowKey(f2), &Token{
+		AccessToken: "access-0", RefreshToken: "refresh-0",
+		Expiry: time.Now().Add(-time.Minute), Issuer: f2.Issuer + "/",
+	}))
+	tok, err = f2.Token(context.Background(), "", "")
+	require.NoError(t, err)
+	assert.Equal(t, "access-1", tok)
+}
+
 // -v output must never contain token material (04-oauth.md redaction AC).
 func TestNoTokenMaterialInLogs(t *testing.T) {
 	f := newTestFlow(t, newFakeAS(t), t.TempDir())

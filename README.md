@@ -215,7 +215,10 @@ Windows in v1) falls back to plain `0600` files.
 Refresh is proactive (60 s before expiry) and single-flight across
 processes: several bridge instances coordinate via a file lock, always
 persisting rotated refresh tokens. If refresh is rejected, mcpurl falls back
-to one interactive login — the pending MCP request just waits.
+to one interactive login — the pending MCP request just waits. A refresh
+token goes back only to the authorization server that issued it: if the MCP
+server's metadata starts naming another one, mcpurl logs in there instead of
+handing it the token.
 
 A static client (`clientID`) must be **public** with PKCE S256 and have
 `http://127.0.0.1:<callbackPort>/callback` registered as a redirect URI in
