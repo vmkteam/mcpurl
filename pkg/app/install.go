@@ -138,7 +138,7 @@ func (a *App) Uninstall(client, name string) error {
 		fmt.Fprintf(a.msg, "removed profile @%s from %s (backup: .bak)\n", profName, a.cfg.Path)
 		// Tokens are keyed by url+clientID: once the profile is gone there is
 		// no target left to `logout` with, so drop them here.
-		a.dropTokens(a.store(), prof)
+		a.dropTokens(a.forgetStore(), prof)
 		a.warnOtherClients(client, profName)
 	} else {
 		fmt.Fprintf(a.msg, "no profile @%s in %s\n", profName, a.cfg.Path)

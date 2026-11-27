@@ -150,3 +150,47 @@ func NewStore(noKeychain bool) Store {
 	}
 	return KeychainStore{files: fileStore}
 }
+
+// ForgetStore is the store dropping a token works on: the backend NewStore
+// picks plus plain files. A token saved with --no-keychain sits in a plain
+// file; logout looking only at the keychain copy would leave it behind and
+// say nothing. --no-keychain keeps the keychain out of it here too.
+func ForgetStore(noKeychain bool) Store {
+	primary := NewStore(noKeychain)
+	if _, plain := primary.(*FileStore); plain {
+		return primary
+	}
+	return storeSet{primary, &FileStore{Dir: TokensDir()}}
+}
+
+// storeSet spans several backends for Forget: Load answers from the first
+// that holds the token, Delete removes it from every one, Save writes the
+// first.
+type storeSet []Store
+
+func (s storeSet) Load(key string) (*Token, error) {
+	var firstErr error
+	for _, st := range s {
+		t, err := st.Load(key)
+		if err == nil {
+			return t, nil
+		}
+		if !errors.Is(err, ErrNotFound) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return nil, ErrNotFound
+}
+
+func (s storeSet) Save(key string, t *Token) error { return s[0].Save(key, t) }
+
+func (s storeSet) Delete(key string) error {
+	errs := make([]error, 0, len(s))
+	for _, st := range s {
+		errs = append(errs, st.Delete(key))
+	}
+	return errors.Join(errs...)
+}

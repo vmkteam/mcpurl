@@ -207,6 +207,10 @@ func (a *App) tokenProvider() mcp.TokenProvider {
 // store is the token backend for this run (--no-keychain forces files).
 func (a *App) store() oauth.Store { return oauth.NewStore(a.opts.NoKeychain) }
 
+// forgetStore is the store logout and uninstall drop tokens from: every
+// backend a token may have been saved to (oauth.ForgetStore).
+func (a *App) forgetStore() oauth.Store { return oauth.ForgetStore(a.opts.NoKeychain) }
+
 func (a *App) flow() *oauth.Flow { return a.flowFor(a.prof, a.store()) }
 
 // flowFor builds the token flow of any profile — logout --all and show walk

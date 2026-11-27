@@ -67,14 +67,18 @@ func (a *App) AccessToken(ctx context.Context) (string, error) {
 // Logout drops the stored token for the resolved profile, and its dynamic
 // client registration when it has one.
 func (a *App) Logout() error {
-	a.dropTokens(a.store(), a.prof)
+	if a.dropTokens(a.forgetStore(), a.prof) {
+		// Silence would read as "done" — and send the user looking for
+		// whatever they expected to be dropped.
+		fmt.Fprintf(a.msg, "nothing stored for %s\n", a.prof.URL)
+	}
 	return nil
 }
 
 // LogoutAll drops tokens for every configured profile plus file-backend
 // leftovers from bare-URL runs; needs no target resolution.
 func (a *App) LogoutAll() error {
-	store := a.store()
+	store := a.forgetStore()
 	for _, name := range a.cfg.Names() {
 		a.dropTokens(store, a.cfg.Profiles[name])
 	}
@@ -84,15 +88,16 @@ func (a *App) LogoutAll() error {
 
 // dropTokens deletes the stored token for p and its dynamic client
 // registration (oauth.Flow.Forget). Nothing is reported when there was
-// nothing stored — "dropped tokens" for an empty store reads as a lie.
-func (a *App) dropTokens(store oauth.Store, p Profile) {
+// nothing stored — "dropped tokens" for an empty store reads as a lie; empty
+// tells the caller so, and is false when Forget failed (that is warned).
+func (a *App) dropTokens(store oauth.Store, p Profile) (empty bool) {
 	if p.URL == "" {
-		return
+		return true
 	}
 	token, registration, err := a.flowFor(p, store).Forget()
 	if err != nil {
 		a.warnf("logout %s: %v", p.Name, err)
-		return
+		return false
 	}
 	if token {
 		fmt.Fprintf(a.msg, "dropped tokens for %s\n", p.URL)
@@ -100,6 +105,7 @@ func (a *App) dropTokens(store oauth.Store, p Profile) {
 	if registration {
 		fmt.Fprintf(a.msg, "dropped client registration for %s\n", p.URL)
 	}
+	return !token && !registration
 }
 
 // Show writes the profile list (name == "") or one profile without secrets.

@@ -144,6 +144,18 @@ func TestDynamicClient(t *testing.T) {
 	}
 }
 
+// logout with nothing stored says so: silence reads as "done" and sends the
+// user looking for what they expected to be dropped.
+func TestLogoutNothingStored(t *testing.T) {
+	writeConfig(t)
+	t.Setenv("HOME", t.TempDir())
+	var msg bytes.Buffer
+	a, err := New(Options{Target: "@acme", NoKeychain: true}, &msg)
+	require.NoError(t, err)
+	require.NoError(t, a.Logout())
+	assert.Equal(t, "nothing stored for https://mcp.acme.example/mcp\n", msg.String())
+}
+
 // A server that refuses the credential ends the run on exit code 3, with its
 // own explanation both in the error the CLI prints and in the JSON-RPC error
 // the MCP client shows (docs/tasks/02-401-body-discarded.md).
