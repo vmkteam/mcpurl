@@ -36,14 +36,22 @@ func (a *App) Bridge(ctx context.Context, in io.Reader, out io.Writer) error {
 	return b.Run(ctx)
 }
 
-// Login runs the interactive browser PKCE flow and persists the token.
+// Login runs the interactive browser PKCE flow and persists the token — for
+// a client_credentials profile it mints one instead, and says whom for.
 // With static auth configured it fails with ErrStaticAuth: there is nothing
 // a browser flow could obtain for a bearer-env/no-oauth profile.
 func (a *App) Login(ctx context.Context) (*oauth.Token, error) {
 	if a.staticAuth() {
 		return nil, fmt.Errorf("%w: login does not apply", ErrStaticAuth)
 	}
-	return a.flow().Login(ctx)
+	t, err := a.flow().Login(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if a.prof.Grant == oauth.GrantClientCredentials {
+		fmt.Fprintf(a.msg, "minted a client_credentials token for %s\n", a.subject(t))
+	}
+	return t, nil
 }
 
 // AccessToken returns a valid access token (refreshing or logging in as
@@ -128,6 +136,15 @@ func (a *App) Show(w io.Writer, name string) error {
 	if p.BearerEnv != "" {
 		fmt.Fprintf(w, "bearerEnv:    %s (value not shown)\n", p.BearerEnv)
 	}
+	if p.Grant != "" {
+		fmt.Fprintf(w, "grant:        %s\n", p.Grant)
+	}
+	if p.Username != "" {
+		fmt.Fprintf(w, "username:     %s\n", p.Username)
+	}
+	if p.Grant == oauth.GrantClientCredentials {
+		fmt.Fprintf(w, "secret:       %s (value not shown)\n", p.secretSource())
+	}
 	if len(p.Headers) > 0 {
 		// Keys only — values may embed env secrets.
 		fmt.Fprintf(w, "headers:      %s\n", strings.Join(slices.Sorted(maps.Keys(p.Headers)), ", "))
@@ -163,8 +180,17 @@ func (a *App) ClaudeConfig(w io.Writer, target, name string) error {
     }
   }
 }
-# Claude Code (no bridge needed — connects directly):
+`, name, arg)
+	if prof.Grant == oauth.GrantClientCredentials {
+		// Claude Code's direct HTTP transport logs in through a browser, which
+		// a service account cannot do: the bridge is the only way in.
+		fmt.Fprintf(w, `# Claude Code (service account — through the bridge, the direct transport needs a browser login):
+#   claude mcp add -s user %s -- mcpurl %s
+`, name, arg)
+		return nil
+	}
+	fmt.Fprintf(w, `# Claude Code (no bridge needed — connects directly):
 #   claude mcp add --transport http %s %s
-`, name, arg, name, prof.URL)
+`, name, prof.URL)
 	return nil
 }

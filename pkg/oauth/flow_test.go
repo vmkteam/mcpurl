@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,6 +43,20 @@ type fakeAS struct {
 	registrations   atomic.Int32
 	redirectURIs    []string        // of the last registration (guarded by mu)
 	clients         map[string]bool // registered client_ids (guarded by mu)
+
+	// client_credentials grant (credentials_test.go): the token endpoint
+	// mints for ccUser + ccSecret in the form, or — with ccUser empty — for
+	// ccSecret as the HTTP Basic client secret.
+	ccUser, ccSecret string
+	ccErr, ccErrDesc string // forced refusal when ccErr is set
+	ccNoExpiry       bool   // answer without expires_in
+	ccRedirect       string // answer 307 to this URL instead
+	m2mOnly          bool   // metadata without authorization_endpoint and PKCE
+	prmAS            string // when set, /mcp publishes PRM naming this AS
+	mints            atomic.Int32
+	ccForm           url.Values // of the last mint request (guarded by mu)
+	ccBasicID        string     // decoded HTTP Basic user of the last mint (guarded by mu)
+	ccBasicSecret    string     // decoded HTTP Basic password of the last mint (guarded by mu)
 }
 
 func newFakeAS(t *testing.T) *fakeAS {
@@ -60,11 +76,30 @@ func newFakeAS(t *testing.T) *fakeAS {
 		case f.dcr:
 			md["registration_endpoint"] = f.srv.URL + "/register"
 		}
+		if f.m2mOnly {
+			delete(md, "authorization_endpoint")
+			delete(md, "code_challenge_methods_supported")
+		}
 		json.NewEncoder(w).Encode(md)
 	})
 	mux.HandleFunc("/register", f.register)
+	mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", func(w http.ResponseWriter, r *http.Request) {
+		if f.prmAS == "" {
+			http.NotFound(w, r)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"resource":              f.srv.URL + "/mcp",
+			"authorization_servers": []string{f.prmAS},
+			"scopes_supported":      []string{"openid", "entitlements"},
+		})
+	})
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
+		if r.Form.Get("grant_type") == GrantClientCredentials {
+			f.clientCredentials(w, r)
+			return
+		}
 		if r.Form.Get("grant_type") != "refresh_token" {
 			http.Error(w, `{"error":"unsupported_grant_type"}`, http.StatusBadRequest)
 			return
@@ -118,10 +153,39 @@ func newTestFlow(t *testing.T, as *fakeAS, dir string) *Flow {
 	}
 }
 
+// flowKey is the store key f uses for its token — identity included, so it
+// stays right for a client_credentials flow too.
+func flowKey(f *Flow) string {
+	canonical, _ := Canonicalize(f.Endpoint)
+	return Key(canonical, f.identity())
+}
+
+// captureOutput routes everything the flows say — debug, warnings, user
+// messages — into one list; the returned func snapshots it.
+func captureOutput(flows ...*Flow) func() []string {
+	var (
+		mu    sync.Mutex
+		lines []string
+	)
+	capture := func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}
+	for _, f := range flows {
+		f.Logf, f.Warnf = capture, capture
+		f.Msg = writeFn(func(p []byte) (int, error) { capture("%s", p); return len(p), nil })
+	}
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(lines)
+	}
+}
+
 func seedToken(t *testing.T, f *Flow) string {
 	t.Helper()
-	canonical, _ := Canonicalize(f.Endpoint)
-	key := Key(canonical, f.ClientID)
+	key := flowKey(f)
 	err := f.Store.Save(key, &Token{
 		AccessToken:  "access-0",
 		RefreshToken: "refresh-0",
@@ -300,8 +364,7 @@ func TestRefreshAdoptsGrantedScopes(t *testing.T) {
 	as.grantedScope = "openid profile"
 	f := newTestFlow(t, as, t.TempDir())
 
-	canonical, _ := Canonicalize(f.Endpoint)
-	key := Key(canonical, f.ClientID)
+	key := flowKey(f)
 	require.NoError(t, f.Store.Save(key, &Token{
 		AccessToken: "access-0", RefreshToken: "refresh-0",
 		Expiry: time.Now().Add(-time.Minute),
@@ -327,25 +390,13 @@ func TestRefreshAdoptsGrantedScopes(t *testing.T) {
 
 // -v output must never contain token material (04-oauth.md redaction AC).
 func TestNoTokenMaterialInLogs(t *testing.T) {
-	as := newFakeAS(t)
-	dir := t.TempDir()
-	var logs []string
-	var mu sync.Mutex
-	f := newTestFlow(t, as, dir)
-	capture := func(format string, args ...any) {
-		mu.Lock()
-		logs = append(logs, fmt.Sprintf(format, args...))
-		mu.Unlock()
-	}
-	f.Logf = capture
-	f.Msg = writeFn(func(p []byte) (int, error) { capture("%s", p); return len(p), nil })
+	f := newTestFlow(t, newFakeAS(t), t.TempDir())
+	logs := captureOutput(f)
 	seedToken(t, f)
 
 	_, err := f.Token(context.Background(), "", "")
 	require.NoError(t, err)
-	mu.Lock()
-	defer mu.Unlock()
-	for _, l := range logs {
+	for _, l := range logs() {
 		for _, secret := range []string{"access-", "refresh-"} {
 			assert.NotContains(t, l, secret, "log line leaks token material")
 		}

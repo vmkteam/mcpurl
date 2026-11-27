@@ -21,12 +21,15 @@ const expirySkew = 60 * time.Second // proactive refresh window (04-oauth.md)
 // Flow implements mcp.TokenProvider: in-memory + stored-token fast path,
 // flock-single-flight refresh with rotation, deterministic fallthrough to
 // exactly one interactive login. This is the part mcp-remote got wrong.
+// With Credentials it mints by the client_credentials grant instead, and
+// never opens a browser (credentials.go).
 type Flow struct {
 	Endpoint     string   // MCP endpoint (canonicalized internally)
 	ClientID     string   // empty = dynamic client registration (register.go)
 	Scopes       []string // override; empty = discovery-driven
 	Issuer       string   // override; skips RFC 9728
 	CallbackPort int
+	Credentials  *ClientCredentials // non-nil = client_credentials grant, no browser; needs ClientID
 	Store        Store
 	Clients      *ClientStore // dynamic registrations; nil = ClientsDir()
 	LockDir      string       // default: LockDir()
@@ -41,11 +44,17 @@ type Flow struct {
 	mu     sync.Mutex // in-process single-flight (flock handles cross-process)
 	cached *Token
 	reg    *Registration // dynamic registration in use; nil with a configured ClientID
-	// Tokens issued by our own refresh / login in this process: if the server
-	// rejects even those, escalate (refresh → login → give up), never loop.
+	// Tokens issued by our own refresh / login / mint in this process: if the
+	// server rejects even those, escalate (refresh → login → give up), never
+	// loop.
 	lastRefreshed string
 	lastLoggedIn  string
+	lastMinted    string
 
+	mintFail       *mintFailure // last refused mint, answered from memory for a while
+	noExpiryWarned bool         // the AS's missing expires_in was reported
+
+	// loginFn replaces browserLogin in tests — the only way to the browser.
 	loginFn func(ctx context.Context, d *discovery, scopes []string) (*Token, error)
 }
 
@@ -70,7 +79,24 @@ func (f *Flow) resourceKey() (canonical, key string, err error) {
 		}
 		f.reg = reg
 	}
-	return canonical, Key(canonical, f.clientID()), nil
+	return canonical, Key(canonical, f.identity()), nil
+}
+
+// identity is whom a stored token belongs to — the input of its store and
+// lock key. For the browser login that is the client: the key existing tokens
+// are stored under. A service profile shares URL and public client_id with
+// the human profile of the same server, so its identity adds the grant, the
+// account and where the secret comes from: a stored token is reused only by
+// a profile that could have minted it itself. Keyed by less, a human and a
+// robot would load each other's token (and a mint would drop the human's
+// refresh token), and a profile with a wrong password would serve the token
+// another profile of the same account minted. Caller holds f.mu.
+func (f *Flow) identity() string {
+	if f.Credentials == nil {
+		return f.clientID()
+	}
+	c := f.Credentials
+	return strings.Join([]string{f.clientID(), GrantClientCredentials, c.Username, c.SecretSource}, "\x00")
 }
 
 func (f *Flow) lockDir() string {
@@ -85,6 +111,16 @@ func (f *Flow) httpc() *http.Client {
 		return f.HTTP
 	}
 	return http.DefaultClient
+}
+
+// tokenClient is httpc for token-endpoint requests: same transport and pool,
+// but no redirects. On 307/308 http.Client re-sends the body — a password, a
+// refresh token, an authorization code — to any Location, another host or
+// plain http included; it strips only the Authorization header.
+func (f *Flow) tokenClient() *http.Client {
+	c := *f.httpc()
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &c
 }
 
 func (f *Flow) debugf(format string, args ...any) {
@@ -173,6 +209,10 @@ func (f *Flow) obtain(ctx context.Context, key, canonical, rejected, challenge s
 		return stored.AccessToken, nil
 	}
 
+	if f.Credentials != nil {
+		return f.obtainMinted(ctx, key, canonical, rejected, challenge)
+	}
+
 	ch := parseChallenge(challenge)
 
 	// A 401 on a token this process just minted is not a stale credential: the
@@ -182,7 +222,7 @@ func (f *Flow) obtain(ctx context.Context, key, canonical, rejected, challenge s
 	// same kind again — the only thing an escalation buys the user here is a
 	// pointless login window (docs/tasks/02-401-body-discarded.md).
 	if f.selfIssued(rejected) && !ch.staleToken() {
-		return "", rejectionError(ch)
+		return "", rejectionError(ch, checksIssued)
 	}
 
 	d, err := f.discover(ctx, challenge)
@@ -223,7 +263,7 @@ func (f *Flow) obtain(ctx context.Context, key, canonical, rejected, challenge s
 	// Interactive login — at most one browser window per process, whatever the
 	// challenge claims.
 	if rejected != "" && rejected == f.lastLoggedIn {
-		return "", rejectionError(ch)
+		return "", rejectionError(ch, checksIssued)
 	}
 	t, err := f.loginAndSave(ctx, key, d, challenge)
 	if err != nil {
@@ -233,18 +273,27 @@ func (f *Flow) obtain(ctx context.Context, key, canonical, rejected, challenge s
 }
 
 // selfIssued reports that the rejected token is one this process obtained —
-// out of a refresh or a login — rather than one loaded from the store. The
-// anonymous marker "-" (see mcp.TokenProvider) never matches: both fields
-// only ever hold real access tokens.
+// out of a refresh, a login or a mint — rather than one loaded from the
+// store. The anonymous marker "-" (see mcp.TokenProvider) never matches: the
+// fields only ever hold real access tokens.
 func (f *Flow) selfIssued(rejected string) bool {
-	return rejected != "" && (rejected == f.lastRefreshed || rejected == f.lastLoggedIn)
+	return rejected != "" &&
+		(rejected == f.lastRefreshed || rejected == f.lastLoggedIn || rejected == f.lastMinted)
 }
+
+// What a rejectionError tells the operator to compare between the servers.
+const (
+	checksIssued = "the token signing algorithm, the audience/resource, and the issuer"
+	// A minted token gets no "expired" exception (see Flow.obtainMinted), so the
+	// clocks — what that exception exists for — join the list instead.
+	checksMinted = "the token signing algorithm, the audience/resource, the issuer, and the clocks of this machine, the IdP and the server"
+)
 
 // rejectionError names the disagreement instead of the symptom: the token is
 // structurally valid by construction, so the two servers disagree about what
 // a valid token looks like.
-func rejectionError(ch bearerChallenge) error {
-	msg := "server rejects freshly issued tokens; giving up — the authorization server and the resource server disagree (check the token signing algorithm, the audience/resource, and the issuer)"
+func rejectionError(ch bearerChallenge, checks string) error {
+	msg := "server rejects freshly issued tokens; giving up — the authorization server and the resource server disagree (check " + checks + ")"
 	if d := ch.detail(); d != "" {
 		msg += "; server said: " + d
 	}
@@ -289,18 +338,79 @@ var (
 // carry the RFC 8707 resource parameter, and we need rotated refresh tokens
 // surfaced verbatim.
 func (f *Flow) refresh(ctx context.Context, d *discovery, canonical string, stored *Token) (*Token, error) {
-	form := url.Values{
+	tr, err := f.postToken(ctx, d.AS.TokenEndpoint, url.Values{
 		"grant_type":      {grantRefreshToken},
 		grantRefreshToken: {stored.RefreshToken},
 		"client_id":       {f.clientID()},
 		paramResource:     {canonical},
+	}, "")
+	if err != nil {
+		return nil, err // obtain tells invalid_grant / invalid_client apart via errors.Is
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.AS.TokenEndpoint, strings.NewReader(form.Encode()))
+
+	t := &Token{
+		AccessToken:  tr.AccessToken,
+		RefreshToken: stored.RefreshToken, // keep unless rotated
+		Expiry:       tr.expiry(),
+		Issuer:       d.AS.Issuer,
+		ClientID:     f.clientID(),
+		Scopes:       grantedScopes(tr.Scope, stored.Scopes),
+	}
+	if tr.RefreshToken != "" {
+		t.RefreshToken = tr.RefreshToken // ALWAYS take the rotated one
+	}
+	return t, nil
+}
+
+// tokenResponse is a successful token-endpoint answer (RFC 6749 §5.1).
+type tokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int64  `json:"expires_in"`
+	Scope        string `json:"scope"`
+}
+
+// expiry turns the relative expires_in into the absolute time a stored Token
+// carries; zero when the AS sent none.
+func (r *tokenResponse) expiry() time.Time {
+	if r.ExpiresIn <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(time.Duration(r.ExpiresIn) * time.Second)
+}
+
+// tokenEndpointError is a refused token request (RFC 6749 §5.2). Description
+// is server free text: redact it before it reaches a message.
+type tokenEndpointError struct {
+	Status      int
+	Code        string // the `error` field; "" when the body is not an OAuth error
+	Description string
+}
+
+func (e *tokenEndpointError) Error() string {
+	return fmt.Sprintf("token endpoint HTTP %d (%s)", e.Status, e.Code)
+}
+
+// Is lets errors.Is match the error codes obtain acts on.
+func (e *tokenEndpointError) Is(target error) bool {
+	return (target == errInvalidGrant || target == errInvalidClient) && e.Code == target.Error()
+}
+
+// postToken POSTs a token request and decodes the answer — the one place
+// refresh and the client_credentials mint talk to the token endpoint. A
+// non-empty clientSecret authenticates the client with HTTP Basic.
+func (f *Flow) postToken(ctx context.Context, endpoint string, form url.Values, clientSecret string) (*tokenResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := f.httpc().Do(req)
+	if clientSecret != "" {
+		// RFC 6749 §2.3.1: both parts form-urlencoded before base64 —
+		// SetBasicAuth alone would garble a secret with ':' or '%' in it.
+		req.SetBasicAuth(url.QueryEscape(f.clientID()), url.QueryEscape(clientSecret))
+	}
+	resp, err := f.tokenClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -312,45 +422,21 @@ func (f *Flow) refresh(ctx context.Context, d *discovery, canonical string, stor
 
 	if resp.StatusCode != http.StatusOK {
 		var oe struct {
-			Error string `json:"error"`
+			Error            string `json:"error"`
+			ErrorDescription string `json:"error_description"`
 		}
 		_ = json.Unmarshal(body, &oe)
-		switch oe.Error {
-		case errInvalidGrant.Error():
-			return nil, errInvalidGrant
-		case errInvalidClient.Error():
-			return nil, fmt.Errorf("token endpoint HTTP %d (%w)", resp.StatusCode, errInvalidClient)
-		}
-		return nil, fmt.Errorf("token endpoint HTTP %d (%s)", resp.StatusCode, oe.Error)
+		return nil, &tokenEndpointError{Status: resp.StatusCode, Code: oe.Error, Description: oe.ErrorDescription}
 	}
 
-	var tr struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int64  `json:"expires_in"`
-		Scope        string `json:"scope"`
-	}
+	var tr tokenResponse
 	if err := json.Unmarshal(body, &tr); err != nil {
 		return nil, fmt.Errorf("bad token response: %w", err)
 	}
 	if tr.AccessToken == "" {
 		return nil, errors.New("token response has no access_token")
 	}
-
-	t := &Token{
-		AccessToken:  tr.AccessToken,
-		RefreshToken: stored.RefreshToken, // keep unless rotated
-		Issuer:       d.AS.Issuer,
-		ClientID:     f.clientID(),
-		Scopes:       grantedScopes(tr.Scope, stored.Scopes),
-	}
-	if tr.RefreshToken != "" {
-		t.RefreshToken = tr.RefreshToken // ALWAYS take the rotated one
-	}
-	if tr.ExpiresIn > 0 {
-		t.Expiry = time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second)
-	}
-	return t, nil
+	return &tr, nil
 }
 
 // grantedScopes prefers the AS's `scope` response over what was requested —
@@ -367,7 +453,8 @@ func grantedScopes(respScope string, requested []string) []string {
 }
 
 // Login runs the interactive browser flow unconditionally (CLI `mcpurl
-// login`), persisting the result.
+// login`), persisting the result. With Credentials it mints instead — no
+// browser.
 func (f *Flow) Login(ctx context.Context) (*Token, error) {
 	canonical, err := Canonicalize(f.Endpoint)
 	if err != nil {
@@ -396,12 +483,13 @@ func (f *Flow) Login(ctx context.Context) (*Token, error) {
 
 	var out *Token
 	lockErr := WithLock(ctx, f.lockDir(), key, func() error {
-		t, err := f.loginAndSave(ctx, key, d, challenge)
-		if err != nil {
-			return err
+		var err error
+		if f.Credentials != nil {
+			out, err = f.mintAndSave(ctx, key, canonical, challenge)
+		} else {
+			out, err = f.loginAndSave(ctx, key, d, challenge)
 		}
-		out = t
-		return nil
+		return err
 	})
 	return out, lockErr
 }

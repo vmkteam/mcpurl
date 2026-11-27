@@ -54,6 +54,16 @@ func TestParseTarget(t *testing.T) {
 			},
 		},
 		{
+			name: "service account flags", args: []string{"--grant", "client_credentials", "--username", "bot",
+				"--password-file", "/etc/bot.secret", "--client-secret-env", "KC", "@a"},
+			wantTarget: "@a",
+			check: func(t *testing.T, o *app.Options) {
+				t.Helper()
+				assert.Equal(t, app.ServiceAccount{Grant: "client_credentials", Username: "bot",
+					PasswordFile: "/etc/bot.secret", ClientSecretEnv: "KC"}, o.ServiceAccount)
+			},
+		},
+		{
 			name: "scopes comma split", args: []string{"--scopes", "openid, profile ,roles", "@a"},
 			wantTarget: "@a",
 			check: func(t *testing.T, o *app.Options) {

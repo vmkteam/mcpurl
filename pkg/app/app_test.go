@@ -68,8 +68,9 @@ func TestNewErrors(t *testing.T) {
 	_, err = New(Options{Target: "@acme", Headers: []string{"no-colon"}}, io.Discard)
 	require.Error(t, err, "malformed header must fail")
 
-	_, err = New(Options{Target: "@acme", BearerEnv: "MCPURL_TEST_UNSET_VAR"}, io.Discard)
-	require.Error(t, err, "unset bearer-env must fail at construction")
+	a, err := New(Options{Target: "@acme", BearerEnv: "MCPURL_TEST_UNSET_VAR"}, io.Discard)
+	require.NoError(t, err, "logout must still resolve the profile")
+	require.Error(t, a.CheckCredentials(), "unset bearer-env must fail before it is used")
 }
 
 func TestNewWithoutTarget(t *testing.T) {

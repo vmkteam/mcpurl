@@ -118,6 +118,11 @@ func (f *Flow) ensureClient(ctx context.Context, challenge string) (canonical, k
 	if !errors.Is(err, errNoClient) {
 		return canonical, key, err
 	}
+	if f.Credentials != nil {
+		// What registration creates is a public client bound to a loopback
+		// redirect — a browser-login client, not a service account's.
+		return "", "", errors.New("client_credentials needs a configured client_id: dynamic registration is for browser logins")
+	}
 	d, err := f.discover(ctx, challenge)
 	if err != nil {
 		return "", "", err
@@ -147,7 +152,7 @@ func (f *Flow) ensureClient(ctx context.Context, challenge string) (canonical, k
 	if err != nil {
 		return "", "", err
 	}
-	return canonical, Key(canonical, f.clientID()), nil
+	return canonical, Key(canonical, f.identity()), nil
 }
 
 // register obtains a client_id from the authorization server: a public
@@ -262,7 +267,7 @@ func (f *Flow) clientReplaced(canonical string) bool {
 // and stop the login the next round owes.
 func (f *Flow) leaveClient() {
 	f.reg, f.cached = nil, nil
-	f.lastRefreshed, f.lastLoggedIn = "", ""
+	f.lastRefreshed, f.lastLoggedIn, f.lastMinted = "", "", ""
 }
 
 // Registration returns the dynamic registration in use for the endpoint; nil
