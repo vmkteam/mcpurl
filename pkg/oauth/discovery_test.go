@@ -58,7 +58,7 @@ func TestParseChallenge(t *testing.T) {
 	const jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.dBjftJeZ4CVP-mB92K27uh"
 	c = parseChallenge(`Bearer error="invalid_token", error_description="Jwt expired: ` + jwt + `"`)
 	assert.NotContains(t, c.detail(), jwt)
-	assert.NotContains(t, rejectionError(c).Error(), jwt)
+	assert.NotContains(t, rejectionError(c, checksIssued).Error(), jwt)
 	assert.Contains(t, c.detail(), "Jwt expired: [redacted JWT]")
 }
 

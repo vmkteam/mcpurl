@@ -138,7 +138,7 @@ func (a *App) Uninstall(client, name string) error {
 		fmt.Fprintf(a.msg, "removed profile @%s from %s (backup: .bak)\n", profName, a.cfg.Path)
 		// Tokens are keyed by url+clientID: once the profile is gone there is
 		// no target left to `logout` with, so drop them here.
-		a.dropTokens(a.store(), prof)
+		a.dropTokens(a.forgetStore(), prof)
 		a.warnOtherClients(client, profName)
 	} else {
 		fmt.Fprintf(a.msg, "no profile @%s in %s\n", profName, a.cfg.Path)
@@ -245,21 +245,16 @@ func (a *App) ensureProfile(w io.Writer, name string, dryRun bool) error {
 func mergeProfile(old, fresh Profile) Profile {
 	out := old
 	out.URL = fresh.URL
-	if fresh.ClientID != "" {
-		out.ClientID = fresh.ClientID
-	}
 	if len(fresh.Scopes) > 0 {
 		out.Scopes = fresh.Scopes
 	}
-	if fresh.CallbackPort != 0 {
-		out.CallbackPort = fresh.CallbackPort
-	}
-	if fresh.Issuer != "" {
-		out.Issuer = fresh.Issuer
-	}
-	if fresh.BearerEnv != "" {
-		out.BearerEnv = fresh.BearerEnv
-	}
+	override(&out.ClientID, fresh.ClientID)
+	override(&out.CallbackPort, fresh.CallbackPort)
+	override(&out.Issuer, fresh.Issuer)
+	override(&out.BearerEnv, fresh.BearerEnv)
+	// The service account is one unit: a new shape replaces the old one whole
+	// instead of mixing with it.
+	override(&out.ServiceAccount, fresh.ServiceAccount)
 	return out
 }
 
@@ -267,7 +262,8 @@ func mergeProfile(old, fresh Profile) Profile {
 // verbatim by mergeProfile, so they can never differ here).
 func sameProfile(a, b Profile) bool {
 	return a.URL == b.URL && a.ClientID == b.ClientID && a.CallbackPort == b.CallbackPort &&
-		a.Issuer == b.Issuer && a.BearerEnv == b.BearerEnv && slices.Equal(a.Scopes, b.Scopes)
+		a.Issuer == b.Issuer && a.BearerEnv == b.BearerEnv && slices.Equal(a.Scopes, b.Scopes) &&
+		a.ServiceAccount == b.ServiceAccount
 }
 
 func appendProfile(path, block string) error {
@@ -338,6 +334,16 @@ func profileTOML(name string, p Profile) string {
 	}
 	if p.BearerEnv != "" {
 		fmt.Fprintf(&b, "bearerEnv = %q\n", p.BearerEnv)
+	}
+	sa := p.ServiceAccount
+	for _, kv := range [][2]string{
+		{"grant", sa.Grant}, {"username", sa.Username},
+		{"passwordFile", sa.PasswordFile}, {"passwordEnv", sa.PasswordEnv},
+		{"clientSecretFile", sa.ClientSecretFile}, {"clientSecretEnv", sa.ClientSecretEnv},
+	} {
+		if kv[1] != "" {
+			fmt.Fprintf(&b, "%s = %q\n", kv[0], kv[1])
+		}
 	}
 	if len(p.Headers) > 0 {
 		fmt.Fprintf(&b, "\n  [profiles.%s.headers]\n", name)

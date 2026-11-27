@@ -68,8 +68,9 @@ func TestNewErrors(t *testing.T) {
 	_, err = New(Options{Target: "@acme", Headers: []string{"no-colon"}}, io.Discard)
 	require.Error(t, err, "malformed header must fail")
 
-	_, err = New(Options{Target: "@acme", BearerEnv: "MCPURL_TEST_UNSET_VAR"}, io.Discard)
-	require.Error(t, err, "unset bearer-env must fail at construction")
+	a, err := New(Options{Target: "@acme", BearerEnv: "MCPURL_TEST_UNSET_VAR"}, io.Discard)
+	require.NoError(t, err, "logout must still resolve the profile")
+	require.Error(t, a.CheckCredentials(), "unset bearer-env must fail before it is used")
 }
 
 func TestNewWithoutTarget(t *testing.T) {
@@ -141,6 +142,18 @@ func TestDynamicClient(t *testing.T) {
 			assert.Contains(t, msg.String(), "dropped client registration for "+endpoint)
 		})
 	}
+}
+
+// logout with nothing stored says so: silence reads as "done" and sends the
+// user looking for what they expected to be dropped.
+func TestLogoutNothingStored(t *testing.T) {
+	writeConfig(t)
+	t.Setenv("HOME", t.TempDir())
+	var msg bytes.Buffer
+	a, err := New(Options{Target: "@acme", NoKeychain: true}, &msg)
+	require.NoError(t, err)
+	require.NoError(t, a.Logout())
+	assert.Equal(t, "nothing stored for https://mcp.acme.example/mcp\n", msg.String())
 }
 
 // A server that refuses the credential ends the run on exit code 3, with its

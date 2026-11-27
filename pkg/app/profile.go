@@ -27,6 +27,21 @@ type Profile struct {
 	Issuer       string            `toml:"issuer"`
 	BearerEnv    string            `toml:"bearerEnv"`
 	Headers      map[string]string `toml:"headers"`
+
+	ServiceAccount // flattened: grant, username, passwordFile, …
+}
+
+// ServiceAccount is the client_credentials part of a profile (credentials.go).
+// Like the rest of the profile it says where a secret lives — a file path or
+// an env var name — never the secret itself. It is one unit: install
+// replaces it whole, a new credential shape never mixes with the old one.
+type ServiceAccount struct {
+	Grant            string `toml:"grant"`            // "" = browser login; oauth.GrantClientCredentials
+	Username         string `toml:"username"`         // authentik service account; "" = client-secret shape
+	PasswordFile     string `toml:"passwordFile"`     // the account's app password …
+	PasswordEnv      string `toml:"passwordEnv"`      // … or the env var holding it (MY_<NAME> first)
+	ClientSecretFile string `toml:"clientSecretFile"` // the client secret (Keycloak) …
+	ClientSecretEnv  string `toml:"clientSecretEnv"`  // … or the env var holding it
 }
 
 // Config is the whole config.toml.
@@ -132,10 +147,20 @@ func ExpandHeaders(h map[string]string) map[string]string {
 }
 
 // BearerFromEnv implements the vmkteam convention: MY_<NAME> wins over
-// <NAME>. Returns "" when neither is set.
+// <NAME>. Returns "" when neither is set. Every env-held credential is looked
+// up this way — the static bearer and the service-account secrets alike.
 func BearerFromEnv(name string) string {
 	if v := os.Getenv("MY_" + name); v != "" {
 		return v
 	}
 	return os.Getenv(name)
+}
+
+// envValue is BearerFromEnv for a value that must be there: the error names
+// both variables it looked at.
+func envValue(name string) (string, error) {
+	if v := BearerFromEnv(name); v != "" {
+		return v, nil
+	}
+	return "", fmt.Errorf("neither MY_%s nor %s is set", name, name)
 }

@@ -36,14 +36,22 @@ func (a *App) Bridge(ctx context.Context, in io.Reader, out io.Writer) error {
 	return b.Run(ctx)
 }
 
-// Login runs the interactive browser PKCE flow and persists the token.
+// Login runs the interactive browser PKCE flow and persists the token — for
+// a client_credentials profile it mints one instead, and says whom for.
 // With static auth configured it fails with ErrStaticAuth: there is nothing
 // a browser flow could obtain for a bearer-env/no-oauth profile.
 func (a *App) Login(ctx context.Context) (*oauth.Token, error) {
 	if a.staticAuth() {
 		return nil, fmt.Errorf("%w: login does not apply", ErrStaticAuth)
 	}
-	return a.flow().Login(ctx)
+	t, err := a.flow().Login(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if a.prof.Grant == oauth.GrantClientCredentials {
+		fmt.Fprintf(a.msg, "minted a client_credentials token for %s\n", a.subject(t))
+	}
+	return t, nil
 }
 
 // AccessToken returns a valid access token (refreshing or logging in as
@@ -59,14 +67,18 @@ func (a *App) AccessToken(ctx context.Context) (string, error) {
 // Logout drops the stored token for the resolved profile, and its dynamic
 // client registration when it has one.
 func (a *App) Logout() error {
-	a.dropTokens(a.store(), a.prof)
+	if a.dropTokens(a.forgetStore(), a.prof) {
+		// Silence would read as "done" — and send the user looking for
+		// whatever they expected to be dropped.
+		fmt.Fprintf(a.msg, "nothing stored for %s\n", a.prof.URL)
+	}
 	return nil
 }
 
 // LogoutAll drops tokens for every configured profile plus file-backend
 // leftovers from bare-URL runs; needs no target resolution.
 func (a *App) LogoutAll() error {
-	store := a.store()
+	store := a.forgetStore()
 	for _, name := range a.cfg.Names() {
 		a.dropTokens(store, a.cfg.Profiles[name])
 	}
@@ -76,15 +88,16 @@ func (a *App) LogoutAll() error {
 
 // dropTokens deletes the stored token for p and its dynamic client
 // registration (oauth.Flow.Forget). Nothing is reported when there was
-// nothing stored — "dropped tokens" for an empty store reads as a lie.
-func (a *App) dropTokens(store oauth.Store, p Profile) {
+// nothing stored — "dropped tokens" for an empty store reads as a lie; empty
+// tells the caller so, and is false when Forget failed (that is warned).
+func (a *App) dropTokens(store oauth.Store, p Profile) (empty bool) {
 	if p.URL == "" {
-		return
+		return true
 	}
 	token, registration, err := a.flowFor(p, store).Forget()
 	if err != nil {
 		a.warnf("logout %s: %v", p.Name, err)
-		return
+		return false
 	}
 	if token {
 		fmt.Fprintf(a.msg, "dropped tokens for %s\n", p.URL)
@@ -92,6 +105,7 @@ func (a *App) dropTokens(store oauth.Store, p Profile) {
 	if registration {
 		fmt.Fprintf(a.msg, "dropped client registration for %s\n", p.URL)
 	}
+	return !token && !registration
 }
 
 // Show writes the profile list (name == "") or one profile without secrets.
@@ -128,6 +142,15 @@ func (a *App) Show(w io.Writer, name string) error {
 	if p.BearerEnv != "" {
 		fmt.Fprintf(w, "bearerEnv:    %s (value not shown)\n", p.BearerEnv)
 	}
+	if p.Grant != "" {
+		fmt.Fprintf(w, "grant:        %s\n", p.Grant)
+	}
+	if p.Username != "" {
+		fmt.Fprintf(w, "username:     %s\n", p.Username)
+	}
+	if p.Grant == oauth.GrantClientCredentials {
+		fmt.Fprintf(w, "secret:       %s (value not shown)\n", p.secretSource())
+	}
 	if len(p.Headers) > 0 {
 		// Keys only — values may embed env secrets.
 		fmt.Fprintf(w, "headers:      %s\n", strings.Join(slices.Sorted(maps.Keys(p.Headers)), ", "))
@@ -163,8 +186,17 @@ func (a *App) ClaudeConfig(w io.Writer, target, name string) error {
     }
   }
 }
-# Claude Code (no bridge needed — connects directly):
+`, name, arg)
+	if prof.Grant == oauth.GrantClientCredentials {
+		// Claude Code's direct HTTP transport logs in through a browser, which
+		// a service account cannot do: the bridge is the only way in.
+		fmt.Fprintf(w, `# Claude Code (service account — through the bridge, the direct transport needs a browser login):
+#   claude mcp add -s user %s -- mcpurl %s
+`, name, arg)
+		return nil
+	}
+	fmt.Fprintf(w, `# Claude Code (no bridge needed — connects directly):
 #   claude mcp add --transport http %s %s
-`, name, arg, name, prof.URL)
+`, name, prof.URL)
 	return nil
 }

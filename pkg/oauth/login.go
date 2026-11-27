@@ -104,7 +104,9 @@ func (f *Flow) browserLogin(ctx context.Context, d *discovery, scopes []string) 
 		return nil, res.err
 	}
 
-	tok, err := cfg.Exchange(ctx, res.code, oauth2.VerifierOption(verifier), resource)
+	// The code and verifier are a credential too: no redirects (tokenClient).
+	exchangeCtx := context.WithValue(ctx, oauth2.HTTPClient, f.tokenClient())
+	tok, err := cfg.Exchange(exchangeCtx, res.code, oauth2.VerifierOption(verifier), resource)
 	if err != nil {
 		return nil, fmt.Errorf("token exchange: %w", err)
 	}

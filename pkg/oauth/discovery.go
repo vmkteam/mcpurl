@@ -1,12 +1,16 @@
 // Package oauth implements the MCP authorization client side: RFC 9728 /
 // 8414 / OIDC discovery, browser PKCE login, single-flight token refresh
-// with rotation handling, and token storage (keychain / files). Zero
-// IdP-specific code — Keycloak and authentik are just discovery results.
+// with rotation handling, the client_credentials grant for service accounts,
+// and token storage (keychain / files). IdP-agnostic: Keycloak and authentik
+// are just discovery results. The one IdP-specific shape — authentik's
+// service-account password in the client_credentials form — is confined to
+// credentials.go.
 package oauth
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +29,7 @@ const (
 	scopeProfile  = "profile"        // OIDC default scope
 	scopeOffline  = "offline_access" // OIDC Core §11: no refresh token without it
 	paramResource = "resource"       // RFC 8707 resource indicator
+	paramClientID = "client_id"      // token-request form field (RFC 6749 §2.3.1)
 	paramScope    = "scope"          // challenge parameter and token-response field
 
 	// Well-known document names (RFC 8414 / RFC 9728 / OIDC Discovery).
@@ -176,6 +181,13 @@ func (f *Flow) fetchJSON(ctx context.Context, rawURL string, out any) error {
 	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out)
 }
 
+// sameIssuer compares issuer identifiers ignoring a single trailing slash —
+// the one equality rule for the RFC 8414 mix-up defense and the pinned
+// issuer of the client_credentials grant.
+func sameIssuer(a, b string) bool {
+	return strings.TrimSuffix(a, "/") == strings.TrimSuffix(b, "/")
+}
+
 // wellKnown inserts /.well-known/<suffix> between host and path
 // (RFC 8414 §3 path insertion; works as the plain root URL for empty path).
 func wellKnown(origin *url.URL, suffix, path string) string {
@@ -259,24 +271,30 @@ func (f *Flow) discoverAS(ctx context.Context, issuer string) (*ASMetadata, erro
 		}
 		// RFC 8414 §3.3 MUST: metadata issuer == requested issuer (mix-up
 		// defense). Compare ignoring a single trailing slash.
-		if strings.TrimSuffix(md.Issuer, "/") != strings.TrimSuffix(issuer, "/") {
+		if !sameIssuer(md.Issuer, issuer) {
 			lastErr = fmt.Errorf("AS metadata at %s declares issuer %q, want %q", p.url, md.Issuer, issuer)
 			f.debugf("%v", lastErr)
 			continue
 		}
-		if md.AuthorizationEndpoint == "" || md.TokenEndpoint == "" {
+		// The client_credentials grant talks to the token endpoint alone: an
+		// AS serving only machine clients may publish nothing else.
+		browser := f.Credentials == nil
+		if md.TokenEndpoint == "" || browser && md.AuthorizationEndpoint == "" {
 			lastErr = fmt.Errorf("AS metadata at %s lacks endpoints", p.url)
 			continue
 		}
-		if err := requireHTTPS(md.AuthorizationEndpoint); err != nil {
-			return nil, err
+		if md.AuthorizationEndpoint != "" {
+			if err := requireHTTPS(md.AuthorizationEndpoint); err != nil {
+				return nil, err
+			}
 		}
 		if err := requireHTTPS(md.TokenEndpoint); err != nil {
 			return nil, err
 		}
 		// PKCE guard: absent code_challenge_methods_supported means the AS
 		// does not support PKCE (RFC 8414) — refuse, no silent downgrade.
-		if !slices.Contains(md.CodeChallengeMethodsSupported, methodS256) {
+		// Only the browser flow has an authorization code to protect.
+		if browser && !slices.Contains(md.CodeChallengeMethodsSupported, methodS256) {
 			return nil, fmt.Errorf("authorization server %s does not advertise PKCE S256 (code_challenge_methods_supported=%v) — refusing", issuer, md.CodeChallengeMethodsSupported)
 		}
 		md.FromOIDC = p.oidc
@@ -299,13 +317,9 @@ func (f *Flow) discover(ctx context.Context, challenge string) (*discovery, erro
 		return nil, err
 	}
 
-	issuer := f.Issuer
-	var prmScopes []string
-	if issuer == "" {
-		issuer, prmScopes, err = f.discoverPRM(ctx, canonical, challenge)
-		if err != nil {
-			return nil, err
-		}
+	issuer, prmScopes, err := f.resolveIssuer(ctx, canonical, challenge)
+	if err != nil {
+		return nil, err
 	}
 	md, err := f.discoverAS(ctx, issuer)
 	if err != nil {
@@ -313,6 +327,34 @@ func (f *Flow) discover(ctx context.Context, challenge string) (*discovery, erro
 	}
 	f.disco = &discovery{AS: md, PRMScopes: prmScopes}
 	return f.disco, nil
+}
+
+// resolveIssuer picks the authorization server (step 1 of the chain). For
+// the browser flow a configured issuer skips RFC 9728. The client_credentials
+// grant needs the issuer configured: its secret goes to whatever this answer
+// names, and the PRM document is the MCP server's to write — a compromised
+// server must not be able to collect the service account's password. The PRM
+// is still read for its scopes, which matter as much as for a login; one that
+// names another authorization server is refused, not followed.
+func (f *Flow) resolveIssuer(ctx context.Context, canonical, challenge string) (issuer string, scopes []string, err error) {
+	if f.Credentials == nil {
+		if f.Issuer != "" {
+			return f.Issuer, nil, nil
+		}
+		return f.discoverPRM(ctx, canonical, challenge)
+	}
+	if f.Issuer == "" {
+		return "", nil, errors.New("client_credentials needs a configured issuer: the service account's secret must not go wherever the MCP server's metadata points")
+	}
+	named, scopes, err := f.discoverPRM(ctx, canonical, challenge)
+	switch {
+	case err != nil:
+		f.debugf("no usable protected resource metadata (%v): using the configured issuer, no PRM scopes", err)
+		return f.Issuer, nil, nil
+	case !sameIssuer(named, f.Issuer):
+		return "", nil, fmt.Errorf("%s names authorization server %s, but the profile pins issuer %s — fix whichever is wrong; the service account's secret goes to the configured issuer only", canonical, named, f.Issuer)
+	}
+	return f.Issuer, scopes, nil
 }
 
 // resolveScopes: flag/profile > WWW-Authenticate scope (authoritative per

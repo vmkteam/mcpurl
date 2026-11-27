@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -37,6 +38,8 @@ type Options struct {
 	Timeout      time.Duration
 	Verbose      bool
 	Version      string // build identity, logged on bridge start
+
+	ServiceAccount // client_credentials flags (-grant, -username, -password-file, …)
 }
 
 // ErrStaticAuth marks operations that make no sense with static auth
@@ -101,35 +104,57 @@ func New(opts Options, msg io.Writer) (*App, error) {
 }
 
 // resolveProfile applies the flag > profile precedence and validates the
-// result: URL scheme and bearer-env presence (fail fast, not on first use).
+// result: URL scheme and the grant settings (fail fast, not on first use).
+// Whether the credentials themselves are there is CheckCredentials' job.
 func resolveProfile(cfg *Config, opts Options) (Profile, error) {
 	prof, err := cfg.Resolve(opts.Target)
 	if err != nil {
 		return Profile{}, err
 	}
-	if opts.ClientID != "" {
-		prof.ClientID = opts.ClientID
-	}
+	override(&prof.ClientID, opts.ClientID)
 	if len(opts.Scopes) > 0 {
 		prof.Scopes = opts.Scopes
 	}
-	if opts.CallbackPort != 0 {
-		prof.CallbackPort = opts.CallbackPort
-	}
-	if opts.Issuer != "" {
-		prof.Issuer = opts.Issuer
-	}
-	if opts.BearerEnv != "" {
-		prof.BearerEnv = opts.BearerEnv
-	}
+	override(&prof.CallbackPort, opts.CallbackPort)
+	override(&prof.Issuer, opts.Issuer)
+	override(&prof.BearerEnv, opts.BearerEnv)
+	sa, flags := &prof.ServiceAccount, opts.ServiceAccount
+	override(&sa.Grant, flags.Grant)
+	override(&sa.Username, flags.Username)
+	override(&sa.PasswordFile, absPath(flags.PasswordFile))
+	override(&sa.PasswordEnv, flags.PasswordEnv)
+	override(&sa.ClientSecretFile, absPath(flags.ClientSecretFile))
+	override(&sa.ClientSecretEnv, flags.ClientSecretEnv)
 
 	if err := checkScheme(prof.URL, opts.AllowHTTP); err != nil {
 		return Profile{}, err
 	}
-	if prof.BearerEnv != "" && BearerFromEnv(prof.BearerEnv) == "" {
-		return Profile{}, fmt.Errorf("bearer-env: neither MY_%s nor %s is set", prof.BearerEnv, prof.BearerEnv)
+	if err := validateGrant(prof, opts.NoOAuth); err != nil {
+		return Profile{}, err
 	}
 	return prof, nil
+}
+
+// override applies a setting over the stored value when it was given (is
+// not the zero value) — a flag over the profile, a fresh install over the
+// stored profile.
+func override[T comparable](dst *T, v T) {
+	var zero T
+	if v != zero {
+		*dst = v
+	}
+}
+
+// absPath pins a path typed on the command line to the directory it was typed
+// in: install persists it, and the MCP client runs mcpurl from elsewhere.
+func absPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
 }
 
 // buildHeaders merges profile headers with option headers ($VAR expanded).
@@ -182,6 +207,10 @@ func (a *App) tokenProvider() mcp.TokenProvider {
 // store is the token backend for this run (--no-keychain forces files).
 func (a *App) store() oauth.Store { return oauth.NewStore(a.opts.NoKeychain) }
 
+// forgetStore is the store logout and uninstall drop tokens from: every
+// backend a token may have been saved to (oauth.ForgetStore).
+func (a *App) forgetStore() oauth.Store { return oauth.ForgetStore(a.opts.NoKeychain) }
+
 func (a *App) flow() *oauth.Flow { return a.flowFor(a.prof, a.store()) }
 
 // flowFor builds the token flow of any profile — logout --all and show walk
@@ -193,6 +222,7 @@ func (a *App) flowFor(p Profile, store oauth.Store) *oauth.Flow {
 		Scopes:       p.Scopes,
 		Issuer:       p.Issuer,
 		CallbackPort: p.CallbackPort,
+		Credentials:  p.credentials(),
 		Store:        store,
 		HTTP:         a.httpc,
 		Logf:         a.logf,

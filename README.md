@@ -5,13 +5,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A single-binary bridge between **stdio MCP clients** (Claude Desktop, Cursor,
-Windsurf) and **remote MCP servers over Streamable HTTP**, with OAuth 2.1
-(PKCE) handled locally. Zero runtime dependencies — no Node, no npx.
+Windsurf, Claude Code) and **remote MCP servers over Streamable HTTP**, with
+OAuth 2.1 handled locally: browser PKCE for people, the `client_credentials`
+grant for service accounts on headless machines. Zero runtime dependencies —
+no Node, no npx.
 
 ```
 Claude Desktop ── stdio ── mcpurl ── HTTPS ── https://mcp.example.com/mcp
                              │
-                             └─ browser PKCE ── Keycloak / authentik / any OAuth 2.1 AS
+                             └─ browser PKCE / client_credentials ── Keycloak / authentik / any OAuth 2.1 AS
 ```
 
 ## Why
@@ -29,7 +31,7 @@ races. mcpurl is a clean-room Go replacement:
 - **Refresh-rotation safe**: atomic writes + cross-process file lock; Keycloak
   "Revoke Refresh Token" mode is the design assumption, not an edge case.
   "Both tokens expired" ends in exactly one browser login — never a loop.
-- **Zero IdP-specific code**: full RFC 9728 / RFC 8414 / OIDC discovery with
+- **IdP-agnostic**: full RFC 9728 / RFC 8414 / OIDC discovery with
   issuer & resource validation and a PKCE downgrade guard. Keycloak today,
   authentik tomorrow — same binary, different profile.
 - **Protocol-version-agnostic passthrough**: JSON-RPC flows through untouched;
@@ -73,15 +75,19 @@ profile it references and the stored tokens. Re-running `install` on an
 existing name updates the profile in place.
 
 > **Claude Code doesn't need a bridge** — it connects directly:
-> `claude mcp add --transport http mysrv https://mcp.example.com/mcp`
+> `claude mcp add --transport http mysrv https://mcp.example.com/mcp`.
+> That holds while the token can come from a browser login; a service account
+> on a headless box needs the bridge — see
+> [Headless / service accounts](#headless--service-accounts).
 
 ## Commands
 
 ```
 mcpurl [flags] <url | @profile>          run the stdio bridge (default command)
 mcpurl login  <url | @profile>           interactive browser PKCE login
+                                         (service account: mint a token)
 mcpurl logout <url | @profile | --all>   drop stored tokens and client registration
-mcpurl token  <url | @profile>           print access_token (auto-refresh)
+mcpurl token  <url | @profile>           print access_token (refreshed or re-minted)
 mcpurl show   [name]                     list profiles / show one (no secrets)
 mcpurl claude-config <url | @profile>    print ready-to-paste client config
 mcpurl install   <url | @profile> [--client claude-desktop|cursor|windsurf]
@@ -117,6 +123,61 @@ scopes       = ["openid", "profile", "offline_access"]
 
 Resolution order for every setting: **flag > profile > discovery > default**.
 
+## Headless / service accounts
+
+On a machine with no browser and no human — a Linux server running Claude
+Code, a CI runner — mcpurl authenticates as a **service account** with the
+OAuth `client_credentials` grant (RFC 6749 §4.4). It mints a short-lived
+access token, stores it like any other, and mints the next one before it
+expires; the MCP client never notices. Nothing ever opens a browser.
+
+```toml
+[profiles.mysrv-bot]
+url          = "https://mcp.example.com/mcp"
+clientID     = "mcp-cli"
+issuer       = "https://auth.example.com/application/o/mysrv/"  # required for service accounts
+grant        = "client_credentials"
+username     = "mcp-bot"                       # authentik service account
+passwordFile = "/etc/mcpurl/mcp-bot.secret"    # its app password; or passwordEnv = "MCP_BOT_PASSWORD"
+# Keycloak-style client secret instead of username + password:
+# clientSecretFile = "/etc/mcpurl/client.secret"   # or clientSecretEnv
+```
+
+The profile names where the secret lives, never the secret. A file is
+re-read at every mint, so rotating it needs no restart; keep it `0600`
+(mcpurl warns otherwise) and give its absolute path.
+
+`issuer` is required here: the secret goes to the IdP the profile names, not
+to whichever authorization server the MCP server's metadata points at — a
+compromised MCP server must not be able to collect the service account's
+password. mcpurl still reads that metadata for its scopes, and refuses to
+run if it names a different authorization server. Then:
+
+```bash
+mcpurl login @mysrv-bot     # mints a token and prints whom it was issued to
+claude mcp add -s user mysrv-bot -- mcpurl @mysrv-bot
+```
+
+Two credential shapes are supported:
+
+- **authentik**: the service account's username and an **app password**
+  token, the client stays public. The provider's grant types must include
+  `client_credentials`, and the account must be bound to the application
+  (and to whatever entitlement carries its role). authentik answers the same
+  `invalid_grant` to a missing grant type, a missing binding and a wrong
+  password — mcpurl's error lists all three.
+- **Standard** (Keycloak and most IdPs): a confidential client with service
+  accounts enabled; set `clientSecretFile` / `clientSecretEnv` and no
+  `username`. In Keycloak leave "Use refresh tokens for client credentials
+  grant" off (the default; the switch is deprecated): with it on, every
+  token mcpurl mints with `offline_access` would leave an offline session
+  behind.
+
+Scopes and the `resource` parameter go as for a browser login: if your IdP
+attaches the audience or the role to a scope (e.g. `offline_access`), request
+it. Without a secret service (no D-Bus on a server) tokens land in plain
+`0600` files under `~/.config/mcpurl/tokens/`.
+
 ## Flags
 
 | Flag | Default | Meaning |
@@ -127,6 +188,10 @@ Resolution order for every setting: **flag > profile > discovery > default**.
 | `--issuer URL` | — | Skip RFC 9728 discovery, use this authorization server |
 | `--header K:V` | — | Extra HTTP header, repeatable; `$VAR` expanded |
 | `--bearer-env NAME` | — | Static bearer from env (`MY_<NAME>` checked first); disables OAuth |
+| `--grant client_credentials` | browser login | Service account, no browser (see above) |
+| `--username NAME` | — | Service account name (authentik shape) |
+| `--password-file PATH` / `--password-env NAME` | — | Where the service account's app password lives |
+| `--client-secret-file PATH` / `--client-secret-env NAME` | — | Where the client secret lives (standard shape, no `--username`) |
 | `--no-oauth` | false | Never attempt OAuth (401 is fatal) |
 | `--no-keychain` | false | Force the file token store |
 | `--no-sse` | false | Don't open the GET listening stream |
@@ -152,11 +217,22 @@ Windows in v1) falls back to plain `0600` files.
 Refresh is proactive (60 s before expiry) and single-flight across
 processes: several bridge instances coordinate via a file lock, always
 persisting rotated refresh tokens. If refresh is rejected, mcpurl falls back
-to one interactive login — the pending MCP request just waits.
+to one interactive login — the pending MCP request just waits. A refresh
+token goes back only to the authorization server that issued it: if the MCP
+server's metadata starts naming another one, mcpurl logs in there instead of
+handing it the token.
 
 A static client (`clientID`) must be **public** with PKCE S256 and have
 `http://127.0.0.1:<callbackPort>/callback` registered as a redirect URI in
 the IdP; dynamic registration sets up both by itself.
+
+A service account never sees a browser: with `grant = "client_credentials"`
+mcpurl mints the access token at the token endpoint of the pinned `issuer`,
+stores it the same way and mints the next one before it expires — see
+[Headless / service accounts](#headless--service-accounts). Token-endpoint
+requests never follow redirects: on 307/308 the form — a password, a refresh
+token, an authorization code — would be re-sent to wherever `Location`
+points.
 
 ## Exit codes
 
@@ -177,6 +253,15 @@ the IdP; dynamic registration sets up both by itself.
 - The browser login page reports an unknown or invalid client? The server has
   forgotten mcpurl's dynamic registration: `mcpurl logout @mysrv` drops it,
   and the next start registers anew.
+- A service account gets `invalid_grant`? authentik gives that same answer
+  for a provider without the `client_credentials` grant type, an account not
+  bound to the application, and a wrong or expired app password — the error
+  lists all three. The refusal is remembered for 30 s (or until the secret
+  changes), so fix the IdP side and wait, or rotate the secret.
+- `… names authorization server X, but the profile pins issuer Y`? The
+  server's metadata points at another IdP than the profile's `issuer`: fix
+  whichever is wrong — the service account's secret goes to the configured
+  issuer only.
 - Manual end-to-end check: `npx @modelcontextprotocol/inspector` with command
   `mcpurl`, args `@mysrv`.
 

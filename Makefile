@@ -3,7 +3,7 @@ MAIN := ./cmd/$(NAME)
 VERSION := $(shell git describe --tags --always --dirty)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-LINT_VERSION := v2.12.2
+LINT_VERSION := v2.15.0
 
 ifeq ($(RACE),1)
 	GOFLAGS+=-race

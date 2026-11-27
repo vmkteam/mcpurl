@@ -93,3 +93,45 @@ func TestWithLockMutualExclusion(t *testing.T) {
 	wg.Wait()
 	assert.Equal(t, 1, maxHeld, "lock allowed concurrent holders")
 }
+
+// logout looks in every backend a token may sit in: a token saved with
+// --no-keychain is a plain file, and the keychain-backed run must still find
+// and drop it — in one Forget, which a dynamic registration needs (it is
+// dropped with the first token it finds).
+func TestForgetSpansStores(t *testing.T) {
+	keychainLike := &FileStore{Dir: t.TempDir()}
+	plain := &FileStore{Dir: t.TempDir()}
+	set := storeSet{keychainLike, plain}
+	key := Key("https://x/mcp", "c")
+
+	_, err := set.Load(key)
+	require.ErrorIs(t, err, ErrNotFound)
+
+	require.NoError(t, plain.Save(key, &Token{AccessToken: "plain"}))
+	tok, err := set.Load(key)
+	require.NoError(t, err)
+	assert.Equal(t, "plain", tok.AccessToken, "found in the second backend")
+
+	// An unreadable copy in one backend does not hide a good one in another.
+	require.NoError(t, os.WriteFile(keychainLike.path(key), []byte("{corrupt"), 0o600))
+	tok, err = set.Load(key)
+	require.NoError(t, err)
+	assert.Equal(t, "plain", tok.AccessToken)
+
+	require.NoError(t, set.Delete(key))
+	for _, st := range set {
+		_, lerr := st.Load(key)
+		require.ErrorIs(t, lerr, ErrNotFound, "dropped from every backend")
+	}
+
+	f := &Flow{Endpoint: "https://x/mcp", ClientID: "c", Store: set,
+		Clients: &ClientStore{Dir: t.TempDir()}, LockDir: t.TempDir()}
+	require.NoError(t, plain.Save(key, &Token{AccessToken: "plain"}))
+	dropped, _, err := f.Forget()
+	require.NoError(t, err)
+	assert.True(t, dropped, "logout reports the plain-file token it dropped")
+	_, err = plain.Load(key)
+	require.ErrorIs(t, err, ErrNotFound)
+
+	assert.IsType(t, &FileStore{}, ForgetStore(true), "--no-keychain keeps the keychain out of logout too")
+}
